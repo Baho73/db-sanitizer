@@ -59,6 +59,11 @@ class TextSanitizer:
     #   SIDE_EFFECTS: пополняет llm_cache и stats
     # END_CONTRACT: sanitize_text
     def sanitize_text(self, text: str) -> tuple[str, list[str]]:
+        # Адресная колонка: значение заменяется ЦЕЛИКОМ синтетическим адресом.
+        # Патчить сущности внутри нельзя - нераспознанный остаток (посёлок, улица,
+        # дом, квартира, код домофона) сохранился бы в копии, а §3.2 это запрещает.
+        if self.aggressive:
+            return self.synthetic_address(text), []
         notes: list[str] = []
         out = _PHONE_RE.sub(lambda m: self.mapper.phone(m.group()), text)
         out = _EMAIL_RE.sub(lambda m: self.mapper.email(m.group()), out)
@@ -69,6 +74,25 @@ class TextSanitizer:
         out = _FIO_INITIALS_RE.sub(lambda m: self._fio_initials(m), out)
         out = _CAP_PAIR_RE.sub(lambda m: self._cap_pair(m, notes), out)
         return out, notes
+
+    # START_CONTRACT: synthetic_address
+    #   PURPOSE: Полная замена адресной строки синтетическим адресом. Ключ -
+    #            нормализованная исходная строка целиком: одинаковые адреса дают
+    #            одинаковую замену, ничего от оригинала не переносится.
+    #   INPUTS: { raw: str - исходная строка любой грязности }
+    #   OUTPUTS: { str - «Регион, г. Город, ул. Улица, д. N, кв. M» }
+    #   SIDE_EFFECTS: none
+    # END_CONTRACT: synthetic_address
+    def synthetic_address(self, raw: str) -> str:
+        from sanitizer.mapper import gen_int_in_range
+
+        key = " ".join(raw.lower().replace("ё", "е").split())
+        region = self.mapper.address_component("region", key).title()
+        city = self.mapper.address_component("city", key + "|c").title()
+        street = self.mapper.address_component("street", key + "|s").title()
+        house = gen_int_in_range(self.salt, key + "|h", 1, 99)
+        flat = gen_int_in_range(self.salt, key + "|f", 1, 250)
+        return f"{region}, г. {city}, ул. {street}, д. {house}, кв. {flat}"
 
     def _snils(self, raw: str) -> str:
         d = normalize_digits(raw)

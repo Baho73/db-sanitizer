@@ -45,7 +45,12 @@ CANARIES = {
     "email_unique": "kanareykin.t@canary-demo.ru",
     "passport_doc": "4501 123456",
     "fio_phone_glued": "Канарейкина В.П., тел. 8-999-777-00-02",
-    "dirty_addr_tail": "спросить Марью Канареевну, домофон 7701",
+    # Канарейки грязного адреса АТОМАРНЫ. Составная строка («имя + домофон»)
+    # проходила проверку при замене одного лишь имени, пока адрес и код домофона
+    # утекали — проверка, которую удовлетворяет частичное исправление, бесполезна.
+    "dirty_addr_name": "Марью Канареевну",
+    "dirty_addr_domofon": "домофон 7701",
+    "dirty_addr_street": "тверскя 5 кв 12",
     "snils_in_text": "123-456-789 64",
 }
 
@@ -118,7 +123,8 @@ def generate_rows(scale: str = "small", seed: int = 42) -> Rows:
                       150000, 3, json.dumps({"phone": CANARIES["phone_jsonb"]}, ensure_ascii=False),
                       1, 1, date(2020, 1, 15)))
     addresses.append((len(addresses) + 1, cid,
-                      f"мск, тверскя 5 кв 12, {CANARIES['dirty_addr_tail']}"))
+                      f"мск, {CANARIES['dirty_addr_street']}, спросить "
+                      f"{CANARIES['dirty_addr_name']}, {CANARIES['dirty_addr_domofon']}"))
     documents.append((len(documents) + 1, cid, "passport", CANARIES["passport_doc"]))
 
     contractors = [(i + 1, f"ООО {fake.company()}"[:160], gen_inn12(_SEED_SALT, f"c{i}"),

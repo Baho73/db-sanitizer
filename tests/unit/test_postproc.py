@@ -76,6 +76,27 @@ def test_no_llm_marks_degradation():
     assert notes == ["low_confidence_ner"] or out == "передать Зюкозавру Хтоническому пакет"
 
 
+def test_address_column_replaced_whole():
+    """Адресная колонка: от исходной строки не остаётся НИЧЕГО - ни улицы,
+    ни квартиры, ни кода домофона (§3.2, регресс найден на живом стенде)."""
+    ts = make_ts()
+    ts.aggressive = True
+    src = "мск, тверскя 5 кв 12, спросить Марью Канареевну, домофон 7701"
+    out, _ = ts.sanitize_text(src)
+    for leak in ("тверскя", "кв 12", "7701", "Канареевну", "мск"):
+        assert leak not in out, leak
+    assert out.startswith(tuple(r.title() for r in CORPORA["region"]))
+    assert ts.sanitize_text(src)[0] == out          # детерминизм
+
+
+def test_address_same_input_same_output():
+    ts = make_ts()
+    ts.aggressive = True
+    a, _ = ts.sanitize_text("г. Видное, пр. Фестивальный 81 кв 159")
+    b, _ = ts.sanitize_text("Г. ВИДНОЕ,  пр. Фестивальный 81 кв 159")
+    assert a == b                                    # ключ - нормализованная строка
+
+
 def test_snils_canary_from_demo():
     ts = make_ts()
     out, _ = ts.sanitize_text("Сверьте СНИЛС 123-456-789 64 в личном деле.")

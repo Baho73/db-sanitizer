@@ -25,7 +25,9 @@ def test_canaries_placed():
     assert (emp[2], emp[3], emp[4]) == tuple(CANARIES["fio_employee"].split())
     assert emp[6] == CANARIES["inn_soft_link"] and emp[11] == CANARIES["email_unique"]
     assert CANARIES["phone_jsonb"] in emp[14]                       # jsonb
-    assert CANARIES["dirty_addr_tail"] in rows.tables["hr.addresses"][-1][2]
+    dirty = rows.tables["hr.addresses"][-1][2]
+    for k in ("dirty_addr_name", "dirty_addr_domofon", "dirty_addr_street"):
+        assert CANARIES[k] in dirty, k   # атомарные канарейки грязного адреса
     assert rows.tables["hr.documents"][-1][3] == CANARIES["passport_doc"]
     assert rows.tables["hr.ticket_comments"][-1][3] == CANARIES["fio_phone_glued"]
     assert CANARIES["snils_in_text"] in rows.tables["hr.tickets"][-1][3]
