@@ -10,6 +10,8 @@
 #
 # START_MODULE_MAP
 #   SemType - перечень семантических типов
+#   PII_TYPES - множество типов, считающихся персональными данными
+#   ClassifiedColumn - результат классификации колонки
 #   rules_detect - правиловый детектор по значениям (КС: ИНН/СНИЛС/ОГРН; контекст: паспорт/КПП)
 #   llm_classify - классификация по метаданным через callable с кэшем
 #   classify - сведение двух голосов -> ClassifiedColumn(sem_type, confidence, unresolved)

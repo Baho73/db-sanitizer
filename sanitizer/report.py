@@ -7,8 +7,10 @@
 # END_MODULE_CONTRACT
 #
 # START_MODULE_MAP
+#   SAMPLE_SQL - выборки образцов для сопоставления «до/после»
 #   build_report - собрать данные сравнения
 #   render_html - самодостаточная страница стенда
+#   md_table_to_html - markdown-таблица отчёта в HTML
 # END_MODULE_MAP
 from __future__ import annotations
 

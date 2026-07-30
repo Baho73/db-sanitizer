@@ -15,6 +15,7 @@
         <V-M-POSTPROC />
         <V-M-VERIFIER />
         <V-M-RUNLOG />
+        <V-M-REPORT />
         <V-M-CLI />
       </Owns>
     </VD-MAIN>

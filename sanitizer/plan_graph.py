@@ -8,6 +8,7 @@
 # END_MODULE_CONTRACT
 #
 # START_MODULE_MAP
+#   PlanState - состояние графа планирования
 #   build_graph - собрать StateGraph с checkpointer
 #   run_planning - выполнить до гейта; вернуть паузу или готовый план
 #   resume_approved - продолжить после аппрува (Command(resume=...))

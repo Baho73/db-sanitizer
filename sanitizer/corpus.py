@@ -8,6 +8,7 @@
 # END_MODULE_CONTRACT
 #
 # START_MODULE_MAP
+#   REQUIRED_KEYS - обязательные ключи компонент корпуса
 #   load_components - чтение компонент корпуса из JSON (fixtures или кэш LLM)
 #   build_corpora - компоненты -> словарь корпусов для Mapper
 #   validate_corpus - формат/КС/дубли/длина; список нарушений

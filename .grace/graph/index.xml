@@ -15,6 +15,7 @@
         <M-POSTPROC />
         <M-VERIFIER />
         <M-RUNLOG />
+        <M-REPORT />
         <M-CLI />
         <DF-PLAN />
         <DF-RUN />

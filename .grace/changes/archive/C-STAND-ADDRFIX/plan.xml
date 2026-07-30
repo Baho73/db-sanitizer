@@ -1,0 +1,84 @@
+<GraceChangePlan graceVersion="4.0" status="applied">
+  <C-STAND-ADDRFIX>
+    <IntentSummary>Согласование durable-состояния с кодом после архивации C-MVP-SANITIZER: ввод M-REPORT, закрытие утечки адресных колонок с атомарными канарейками, приведение семантической разметки к фактическим экспортам. Порядок: сначала фикс утечки и его регресс-тесты (данные важнее документации), затем ввод модуля стенда в граф и верификацию, в конце — разметка и повторные прогоны как свидетельство.</IntentSummary>
+    <BaselineAssertions>
+      <MustExist>
+        <Value>sanitizer/report.py</Value>
+        <Value>sanitizer/postproc.py</Value>
+        <Value>.grace/changes/archive/C-MVP-SANITIZER/spec.xml</Value>
+      </MustExist>
+    </BaselineAssertions>
+    <TargetAssertions>
+      <MustVerify>
+        <Module>M-REPORT</Module>
+        <Module>M-POSTPROC</Module>
+        <Module>M-DEMO-DB</Module>
+      </MustVerify>
+      <MustPassCommand>
+        <Command>python -m pytest tests/unit -q</Command>
+      </MustPassCommand>
+    </TargetAssertions>
+    <DurableScope>
+      <GraphAnchors>
+        <M-REPORT />
+        <M-POSTPROC />
+        <M-DEMO-DB />
+      </GraphAnchors>
+      <VerificationAnchors>
+        <V-M-REPORT />
+        <V-M-POSTPROC />
+        <V-M-DEMO-DB />
+      </VerificationAnchors>
+    </DurableScope>
+    <ObservedWriteScope>
+      <File>sanitizer/report.py</File>
+      <File>sanitizer/postproc.py</File>
+      <File>sanitizer/demo/seed.py</File>
+      <File>sanitizer/cli.py</File>
+      <File>sanitizer/mapper.py</File>
+      <File>sanitizer/corpus.py</File>
+      <File>sanitizer/classifier.py</File>
+      <File>sanitizer/policy.py</File>
+      <File>sanitizer/plan_graph.py</File>
+      <Glob>tests/unit/*.py</Glob>
+    </ObservedWriteScope>
+    <ImplementationPlan>
+      <T-001>
+        <Title>Закрыть утечку адресных колонок и сделать канарейки атомарными</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>TextSanitizer.synthetic_address заменяет адресную строку целиком; ключ - нормализованный оригинал, замена детерминирована и консистентна.</Criterion>
+          <Criterion>Канарейки грязного адреса разделены на dirty_addr_name / dirty_addr_domofon / dirty_addr_street; частичное исправление больше не удовлетворяет проверку.</Criterion>
+          <Criterion>Два регресс-теста: ни одного фрагмента оригинала в выходе; одинаковый вход даёт одинаковый выход.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_postproc.py tests/unit/test_demo_db.py -q</Command>
+        </Verification>
+      </T-001>
+      <T-002>
+        <Title>Ввести M-REPORT в граф, индекс и верификацию</Title>
+        <DependsOn>T-001</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Узел M-REPORT описан в graph/main.xml с назначением, путём и зависимостями; перечислен в graph/index.xml.</Criterion>
+          <Criterion>Запись V-M-REPORT в verification/main.xml с командой и свидетельством.</Criterion>
+          <Criterion>Описание M-POSTPROC отражает полную замену адресных строк.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit -q</Command>
+        </Verification>
+      </T-002>
+      <T-003>
+        <Title>Привести MODULE_MAP к фактическим экспортам и подтвердить прогонами</Title>
+        <DependsOn>T-002</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>MODULE_MAP девяти модулей перечисляет все публичные экспорты; предупреждений map-mismatch не остаётся.</Criterion>
+          <Criterion>Полный демо-цикл на обоих входах зелёный: 10/10 канареек в источнике, 0/10 в копии.</Criterion>
+          <Criterion>Свидетельства верификации обновлены под фактические числа прогона.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit -q</Command>
+        </Verification>
+      </T-003>
+    </ImplementationPlan>
+  </C-STAND-ADDRFIX>
+</GraceChangePlan>

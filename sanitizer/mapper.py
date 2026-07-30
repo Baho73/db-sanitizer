@@ -10,11 +10,22 @@
 #
 # START_MODULE_MAP
 #   Salt - производная соль HMAC(master[v], recipient, generation)
-#   normalize_fio / normalize_phone / normalize_email / normalize_digits - ключи идентичности
-#   Mapper.pick - значение корпуса по ключу, с пробированием fake(x)!=x
-#   Mapper.fio / phone / email / address - типовые замены
-#   gen_inn10 / gen_inn12 / gen_snils / gen_ogrn / gen_int_in_range / gen_digits_like - generate-стратегия
+#   Mapper - отображение значений в замены по корпусам
+#   normalize_fio - ключ идентичности ФИО (леммы + род)
+#   normalize_phone - ключ идентичности телефона
+#   normalize_email - ключ идентичности email
+#   normalize_digits - ключ идентичности числовых идентификаторов
 #   feminize - женская форма фамилии
+#   FEM_SUFFIX - таблица родовых суффиксов фамилий
+#   gen_inn10 - ИНН физлица из хэша с контрольной суммой
+#   gen_inn12 - ИНН 12 знаков из хэша с контрольными суммами
+#   gen_snils - СНИЛС из хэша с контрольным числом
+#   gen_ogrn - ОГРН/ОГРНИП из хэша с контрольной цифрой
+#   gen_int_in_range - целое в диапазоне без коллизий (Фейстель + cycle-walking)
+#   gen_digits_like - формат-сохраняющая замена цифр
+#   valid_inn - проверка контрольной суммы ИНН
+#   valid_snils - проверка контрольного числа СНИЛС
+#   valid_ogrn - проверка контрольной цифры ОГРН
 # END_MODULE_MAP
 from __future__ import annotations
 

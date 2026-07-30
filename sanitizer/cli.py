@@ -8,6 +8,13 @@
 #
 # START_MODULE_MAP
 #   main - argparse-диспетчер подкоманд
+#   DEF_COMPONENTS - путь к компонентам корпусов по умолчанию
+#   cmd_demo_seed - посев демо-базы
+#   cmd_plan - фаза планирования с гейтом
+#   cmd_run - исполнение: проход 1 и проход 2
+#   cmd_restore - разворачивание дампа в staging вместе со схемой sanitization
+#   cmd_verify - верификация и блокировка публикации
+#   cmd_report - сборка страницы стенда «до/после»
 # END_MODULE_MAP
 from __future__ import annotations
 

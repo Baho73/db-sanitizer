@@ -9,6 +9,8 @@
 #
 # START_MODULE_MAP
 #   SCALES - профили масштаба (small по умолчанию, medium/large флагом)
+#   CANARIES - атомарные канареечные образцы ПДн для верификатора
+#   Rows - таблицы прогона + манифест канареек
 #   generate_rows - все таблицы + канарейки, детерминированно по seed
 #   seed_db - DDL + COPY в Postgres, пишет canaries.json
 # END_MODULE_MAP

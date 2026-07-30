@@ -10,7 +10,7 @@
     </V-M-CORPUS>
     <V-M-DEMO-DB>
       <Command>python -m pytest tests/unit/test_demo_db.py -q; python -m sanitizer.cli demo-seed</Command>
-      <Evidence>5 passed + живой посев в Postgres 17: 14 таблиц, ~71k строк (small), все канарейки на местах, DDL согласован с генератором, детерминизм по seed.</Evidence>
+      <Evidence>5 passed + живой посев в Postgres 17: 14 таблиц, ~71k строк (small), DDL согласован с генератором, детерминизм по seed. Канареек 10, все атомарные; верификатор на обоих входах даёт 10/10 в источнике и 0/10 в копии.</Evidence>
     </V-M-DEMO-DB>
     <V-M-PROFILER>
       <Command>python -m pytest tests/integration/test_profiler.py -q</Command>
@@ -38,7 +38,7 @@
     </V-M-EXECUTOR>
     <V-M-POSTPROC>
       <Command>python -m pytest tests/unit/test_postproc.py -q; sanitizer.cli run (проход 2 в docker)</Command>
-      <Evidence>7 passed + живой проход 2 по дампу: regex-страховка (телефон/email/СНИЛС/паспорт), ФИО с инициалами консистентны полной форме, падежные якоря, LLM-кэш, деградации фиксируются; переписаны COPY-потоки 3 freetext-таблиц, sanitization.sql внутри дампа.</Evidence>
+      <Evidence>9 passed + живой проход 2 по дампу: regex-страховка (телефон/email/СНИЛС/паспорт), ФИО с инициалами консистентны полной форме, падежные якоря, LLM-кэш, деградации фиксируются; переписаны COPY-потоки 3 freetext-таблиц, sanitization.sql внутри дампа. РЕГРЕСС ЗАКРЫТ: адресные колонки заменяются целиком — сверка в базе показывает «п. Териберка, пер. Нагорный 28 кв 196… домофон 2519» → «Орловская Область, г. Анива, ул. Народная, д. 1, кв. 140»; два теста стерегут отсутствие любых фрагментов оригинала и детерминизм.</Evidence>
     </V-M-POSTPROC>
     <V-M-VERIFIER>
       <Command>python -m pytest tests/unit/test_verifier.py -q; sanitizer.cli verify (в docker)</Command>
@@ -48,6 +48,10 @@
       <Command>python -m pytest tests/unit/test_executor.py::test_runlog_publish_gate -q</Command>
       <Evidence>Гейт публикации: не publishable без verify=done и при любом failed.</Evidence>
     </V-M-RUNLOG>
+    <V-M-REPORT>
+      <Command>python -m sanitizer.cli report (в docker, обе БД подняты); проверка утечек по секции after</Command>
+      <Evidence>Страница собрана (≈14 КБ), развёрнута на https://sanitizer.teamplan.ru за basic-auth. Проверено в браузере на живом сайте: 5 секций, 18+18 строк сравнения, 10 таблиц, горизонтального переполнения body нет, ошибок в консоли нет. Автопроверка: ни одна из 10 канареек не встречается в строках after; адресные фрагменты оригинала (посёлок, улица, квартира, домофон) отсутствуют.</Evidence>
+    </V-M-REPORT>
     <V-M-CLI>
       <Command>python -m sanitizer.cli --help; полный цикл demo-seed/plan/run/restore/verify в docker</Command>
       <Evidence>Сквозной прогон от посева до отчёта верификации; сообщения fail-closed называют колонку и следующий шаг.</Evidence>

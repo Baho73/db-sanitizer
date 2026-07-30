@@ -7,7 +7,12 @@
 # END_MODULE_CONTRACT
 #
 # START_MODULE_MAP
-#   PlanColumn / Plan - модель плана, YAML-сериализация
+#   PlanColumn - решение по одной колонке
+#   Plan - модель плана, YAML-сериализация
+#   schema_fingerprint - отпечаток схемы для детекции дрейфа
+#   DIRECT_THRESHOLD - порог кардинальности для прямого LLM-режима
+#   FAKE_MIN_CARD - минимальная кардинальность для стратегии fake
+#   ADDR_PARSE_THRESHOLD - порог разбираемости адресных строк
 #   assign - ClassifiedColumn + Snapshot + классы -> Plan
 #   validate_plan - fail-closed правила; список ошибок
 #   plan_diff - новые/изменённые колонки между версиями
