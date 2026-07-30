@@ -1,0 +1,14 @@
+<GraceTechnology graceVersion="4.0">
+  <Language>Python 3.12</Language>
+  <Runtime>Docker Compose: контейнеры инструмента, демо-Postgres 16, staging-Postgres 16, Ollama (локальная LLM). Windows 11 — машина разработки; таргет — Linux-контейнеры.</Runtime>
+  <Framework>LangGraph (граф фазы планирования, interrupt + checkpointer для человеческого гейта); Greenmask (движок исполнения, внешний Go-бинарь, engine: hash + Cmd-трансформер); Presidio + spaCy ru_core_news_lg (детекция ПДн и NER); Faker ru_RU (форматы значений); SQLAlchemy (интроспекция каталога)</Framework>
+  <TestingStack>pytest; property-тесты mapper (детерминизм, консистентность форм); golden-снимки схемы для profiler; записанные LLM-ответы для classifier; канареечный набор для verifier; гейт CI — тесты проходят без запущенных Postgres и LLM</TestingStack>
+  <Observability>run_log в служебной схеме (run_id, версии плана/соли/корпуса/кэша/инструмента, стадия, таблица, статус, checksum); схема sanitization с примечаниями о деградации внутри копии; отчёт верификации «до/после»</Observability>
+  <OperationalConstraints>
+    <Constraint>Prefer existing project libraries and established repository patterns.</Constraint>
+    <Constraint>Единый движок замен: все классы эквивалентности и идентичностные типы — только через наш Cmd-процесс; встроенные трансформеры Greenmask — только для одиночных технических колонок.</Constraint>
+    <Constraint>Кэш NER/LLM-решений по свободному тексту — версионируемый артефакт, условие воспроизводимости.</Constraint>
+    <Constraint>Не переизобретать готовое: маскирование дампа — Greenmask, детекция — Presidio, форматы — Faker, оркестрация — LangGraph. Свой код — интеграция, русская специфика, семантика замен.</Constraint>
+    <Constraint>Текст с не-ASCII — всегда UTF-8 явно (encoding="utf-8", PYTHONUTF8=1).</Constraint>
+  </OperationalConstraints>
+</GraceTechnology>

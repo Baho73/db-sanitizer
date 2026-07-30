@@ -1,0 +1,24 @@
+<GraceGraphIndex graceVersion="4.0">
+  <GraphDocuments>
+    <GD-MAIN>
+      <Path>graph/main.xml</Path>
+      <Owns>
+        <M-MAPPER />
+        <M-CORPUS />
+        <M-DEMO-DB />
+        <M-PROFILER />
+        <M-CLASSIFIER />
+        <M-FK-CLOSURE />
+        <M-POLICY />
+        <M-PLAN-GRAPH />
+        <M-EXECUTOR />
+        <M-POSTPROC />
+        <M-VERIFIER />
+        <M-RUNLOG />
+        <M-CLI />
+        <DF-PLAN />
+        <DF-RUN />
+      </Owns>
+    </GD-MAIN>
+  </GraphDocuments>
+</GraceGraphIndex>

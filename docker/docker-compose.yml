@@ -1,0 +1,42 @@
+services:
+  tool:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      demo-db: {condition: service_healthy}
+      staging-db: {condition: service_healthy}
+    volumes: ["../out:/app/out"]
+    profiles: ["tool"]
+
+  demo-db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: demo
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo"]
+      interval: 3s
+      retries: 20
+
+  staging-db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: staging
+      POSTGRES_PASSWORD: staging
+      POSTGRES_DB: staging
+    ports: ["55433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U staging"]
+      interval: 3s
+      retries: 20
+
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["21434:11434"]
+    volumes: ["ollama-models:/root/.ollama"]
+
+volumes:
+  ollama-models: {}

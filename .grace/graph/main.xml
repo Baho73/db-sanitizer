@@ -1,0 +1,75 @@
+<GraceGraphDocument graceVersion="4.0">
+  <GD-MAIN>
+    <M-MAPPER>
+      <Path>sanitizer/mapper.py</Path>
+      <Purpose>Детерминированное ядро замен: ключи идентичности (normalize по типам), производная соль HMAC(master[v], recipient, generation), SHA3-отображение в корпус с пробированием fake(x)!=x, формат-сохраняющая перестановка (Фейстель) для идентификаторов с контрольными суммами.</Purpose>
+      <DependsOn></DependsOn>
+    </M-MAPPER>
+    <M-CORPUS>
+      <Path>sanitizer/corpus.py</Path>
+      <Purpose>Корпуса значений: загрузка компонент (fixtures/LLM-кэш), нормализация, валидатор (формат, КС, дубли, длина под колонку-потребителя).</Purpose>
+      <DependsOn><M-MAPPER /></DependsOn>
+    </M-CORPUS>
+    <M-DEMO-DB>
+      <Path>sanitizer/demo/seed.py</Path>
+      <Purpose>Синтетическая прод-база: 14 таблиц, композитные FK, мягкая связь по ИНН, враждебные случаи §7, канареечный набор с манифестом; детерминирована по seed, масштаб параметризован.</Purpose>
+      <DependsOn><M-MAPPER /></DependsOn>
+    </M-DEMO-DB>
+    <M-PROFILER>
+      <Path>sanitizer/profiler.py</Path>
+      <Purpose>Интроспекция каталога: колонки, ограничения, FK-граф через pg_constraint (композитные корректно), статистика одним запросом на таблицу, ключи jsonb, метрика разбираемости адресов.</Purpose>
+      <DependsOn></DependsOn>
+    </M-PROFILER>
+    <M-CLASSIFIER>
+      <Path>sanitizer/classifier.py</Path>
+      <Purpose>Два независимых голоса: правила по значениям (КС ИНН/СНИЛС/ОГРН; паспорт/КПП по формату+якорям) и LLM по метаданным с кэшем. Расхождение или слепота обоих -> unresolved.</Purpose>
+      <DependsOn><M-MAPPER /><M-PROFILER /></DependsOn>
+    </M-CLASSIFIER>
+    <M-FK-CLOSURE>
+      <Path>sanitizer/fk_closure.py</Path>
+      <Purpose>Классы эквивалентности колонок по FK (композитные поколоночно) + кандидаты мягких связей по вложенности доменов на подтверждение.</Purpose>
+      <DependsOn><M-PROFILER /></DependsOn>
+    </M-FK-CLOSURE>
+    <M-POLICY>
+      <Path>sanitizer/policy.py</Path>
+      <Purpose>Стратегия и LLM-режим по осям чувствительность×кардинальность; модель sanitization-plan.yaml; fail-closed валидация (ПДн в direct, fake на категориях малой кардинальности, null/generalize без подтверждения, jsonb без разметки, дрейф схемы); дифф планов.</Purpose>
+      <DependsOn><M-CLASSIFIER /><M-FK-CLOSURE /><M-PROFILER /></DependsOn>
+    </M-POLICY>
+    <M-PLAN-GRAPH>
+      <Path>sanitizer/plan_graph.py</Path>
+      <Purpose>LangGraph-конвейер планирования: profile -> classify+assign (+overrides человека до диффа) -> interrupt-гейт -> finalize. Checkpointer, продолжение через Command(resume).</Purpose>
+      <DependsOn><M-PROFILER /><M-CLASSIFIER /><M-FK-CLOSURE /><M-POLICY /><M-CORPUS /></DependsOn>
+    </M-PLAN-GRAPH>
+    <M-EXECUTOR>
+      <Path>sanitizer/executor.py, sanitizer/cmd_transformer.py</Path>
+      <Purpose>Проход 1: артефакты (direct-карты, shuffle-перестановки с детерминированным seed), генерация config.yml Greenmask (классы только через Cmd), запуск dump; Cmd-процесс - протокол json-строк, SIGTERM->exit 0, пропуск строки метаданных.</Purpose>
+      <DependsOn><M-MAPPER /><M-CORPUS /><M-POLICY /><M-RUNLOG /></DependsOn>
+    </M-EXECUTOR>
+    <M-POSTPROC>
+      <Path>sanitizer/postproc.py</Path>
+      <Purpose>Проход 2 поверх directory-дампа: переписывание COPY-потоков freetext-таблиц (словарный NER с падежными якорями + regex-страховка + LLM-кэш), sanitization.sql с примечаниями о деградациях внутри каталога дампа.</Purpose>
+      <DependsOn><M-MAPPER /><M-POLICY /><M-RUNLOG /></DependsOn>
+    </M-POSTPROC>
+    <M-VERIFIER>
+      <Path>sanitizer/verifier.py</Path>
+      <Purpose>Проверки §7 на staging: канарейки K/K и 0/K, построчно fake(x)!=x, count(*), ограничения, энтропия с исключениями, сквозная консистентность (таблица+склейка+текст), мягкая связь, чек-суммы для сравнения прогонов.</Purpose>
+      <DependsOn><M-POLICY /></DependsOn>
+    </M-VERIFIER>
+    <M-RUNLOG>
+      <Path>sanitizer/runlog.py</Path>
+      <Purpose>Журнал прогонов (SQLite в контуре): стадии pass1/pass2/verify по таблицам, версии плана/соли/корпуса/кэша/инструмента, гейт публикации publishable().</Purpose>
+      <DependsOn></DependsOn>
+    </M-RUNLOG>
+    <M-CLI>
+      <Path>sanitizer/cli.py</Path>
+      <Purpose>Подкоманды demo-seed / plan / run / restore / verify; сообщения fail-closed с именем колонки и следующим шагом; словарь ФИО источника для NER.</Purpose>
+      <DependsOn><M-PLAN-GRAPH /><M-EXECUTOR /><M-POSTPROC /><M-VERIFIER /><M-DEMO-DB /></DependsOn>
+    </M-CLI>
+    <DF-PLAN>
+      <Description>Фаза планирования: каталог БД -> Snapshot -> голоса классификаторов -> план+overrides -> гейт -> sanitization-plan.yaml в git.</Description>
+    </DF-PLAN>
+    <DF-RUN>
+      <Description>Фаза исполнения: план+соль+корпуса -> Greenmask dump (Cmd, проход 1) -> обвязка дампа (проход 2) -> restore в staging -> верификация -> отчёт и run_log; публикация только после verify=done.</Description>
+    </DF-RUN>
+  </GD-MAIN>
+</GraceGraphDocument>

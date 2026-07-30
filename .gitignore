@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+out/
+*.egg-info/
+# креды и секреты - НИКОГДА
+.cred
+*.pem
+*.key
+.env
+# дампы, соли и кэши никогда не попадают в git
+*.dump
+*.dat.gz
+runlog.db
+llm-cache*.json
+TZ.md
+.claude/

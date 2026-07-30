@@ -1,0 +1,9 @@
+<GracePrinciples graceVersion="4.0">
+  <Principle>Contract-first changes: clarify scope and verification before implementation.</Principle>
+  <Principle>Keep semantic anchors stable and grep-friendly.</Principle>
+  <Principle>Use assertions, scopes, and tests as fresh completion evidence.</Principle>
+  <Principle>Медленная умная петля / быстрая тупая петля: LLM только в фазе планирования и точечно в проходе 2 с кэшем; горячий цикл детерминирован.</Principle>
+  <Principle>Fail-closed по умолчанию: неоднозначность блокирует прогон, а не пропускается молча.</Principle>
+  <Principle>Консистентность вычисляется (хэш по ключу идентичности), а не хранится; разделяемое изменяемое состояние рантайма запрещено.</Principle>
+  <Principle>Каждое обещание имеет число и проверку (критерии §7 проектного документа); «гарантия» без свидетельства не пишется.</Principle>
+</GracePrinciples>

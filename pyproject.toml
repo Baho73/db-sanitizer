@@ -1,0 +1,17 @@
+[project]
+name = "db-sanitizer"
+version = "0.1.0"
+description = "Обезличивание PostgreSQL-баз: LLM-план, детерминированное исполнение (Greenmask + Cmd), верификация"
+requires-python = ">=3.12"
+dependencies = [
+    "faker>=25",
+    "psycopg[binary]>=3.1",
+    "pyyaml>=6",
+    "langgraph>=0.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

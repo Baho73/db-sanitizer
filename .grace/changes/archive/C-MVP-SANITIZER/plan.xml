@@ -1,0 +1,233 @@
+<GraceChangePlan graceVersion="4.0" status="applied">
+  <C-MVP-SANITIZER>
+    <IntentSummary>Реализовать MVP db-sanitizer снизу вверх: сначала детерминированное ядро замен (mapper + ключи идентичности) — оно держит консистентность и тестируется без внешних систем; затем демо-база с канарейками и профайлер; затем конвейер планирования на LangGraph с fail-closed валидацией и человеческим гейтом; затем исполнение двумя проходами (Greenmask+Cmd, обвязка дампа) и верификатор на staging; в конце CLI, сборка и сквозной интеграционный прогон. Порядок минимизирует работу с внешними процессами до того, как ядро доказано property-тестами.</IntentSummary>
+    <BaselineAssertions>
+      <MustExist>
+        <Value>docs/solution-design.md</Value>
+        <Value>TZ.md</Value>
+        <Value>.grace/changes/active/C-MVP-SANITIZER/spec.xml</Value>
+      </MustExist>
+    </BaselineAssertions>
+    <TargetAssertions>
+      <MustVerify>
+        <Module>M-MAPPER</Module>
+        <Module>M-CORPUS</Module>
+        <Module>M-DEMO-DB</Module>
+        <Module>M-PROFILER</Module>
+        <Module>M-CLASSIFIER</Module>
+        <Module>M-FK-CLOSURE</Module>
+        <Module>M-POLICY</Module>
+        <Module>M-PLAN-GRAPH</Module>
+        <Module>M-EXECUTOR</Module>
+        <Module>M-POSTPROC</Module>
+        <Module>M-VERIFIER</Module>
+        <Module>M-RUNLOG</Module>
+        <Module>M-CLI</Module>
+      </MustVerify>
+      <MustPassCommand>
+        <Command>python -m pytest tests/unit -q</Command>
+      </MustPassCommand>
+    </TargetAssertions>
+    <DurableScope>
+      <GraphAnchors>
+        <M-MAPPER />
+        <M-CORPUS />
+        <M-DEMO-DB />
+        <M-PROFILER />
+        <M-CLASSIFIER />
+        <M-FK-CLOSURE />
+        <M-POLICY />
+        <M-PLAN-GRAPH />
+        <M-EXECUTOR />
+        <M-POSTPROC />
+        <M-VERIFIER />
+        <M-RUNLOG />
+        <M-CLI />
+      </GraphAnchors>
+      <VerificationAnchors>
+        <V-M-MAPPER />
+        <V-M-CORPUS />
+        <V-M-DEMO-DB />
+        <V-M-PROFILER />
+        <V-M-CLASSIFIER />
+        <V-M-FK-CLOSURE />
+        <V-M-POLICY />
+        <V-M-PLAN-GRAPH />
+        <V-M-EXECUTOR />
+        <V-M-POSTPROC />
+        <V-M-VERIFIER />
+        <V-M-RUNLOG />
+        <V-M-CLI />
+      </VerificationAnchors>
+    </DurableScope>
+    <ObservedWriteScope>
+      <Glob>sanitizer/**/*.py</Glob>
+      <Glob>tests/**</Glob>
+      <Glob>docker/**</Glob>
+      <File>README.md</File>
+      <File>Makefile</File>
+      <File>pyproject.toml</File>
+      <File>.gitignore</File>
+    </ObservedWriteScope>
+    <ImplementationPlan>
+      <T-001>
+        <Title>Ядро замен: ключи идентичности и детерминированное отображение (M-MAPPER)</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>normalize() по типам из §3.2: ФИО покомпонентно с грамматическим родом, инициалы (наследование от полной формы в классе эквивалентности, иначе однобуквенный ключ), телефон +7..., email как самостоятельный ключ, ИНН/СНИЛС/ОГРН цифрами, адрес компонентами.</Criterion>
+          <Criterion>Отображение SHA3(salt_effective || key) mod |corpus| с детерминированным линейным пробированием при fake(x)==x; salt_effective = HMAC(master[v], recipient || generation).</Criterion>
+          <Criterion>generate-стратегия: ИНН/СНИЛС/ОГРН с досчитанной контрольной суммой, табельный номер в диапазоне, email транслитом с суффиксом, номер договора по формату исходного.</Criterion>
+          <Criterion>Property-тесты: детерминизм повторного вызова; разные формы одной сущности дают одну замену; fake(x)!=x всегда; generate уникален на 10^5 входов; разные (recipient, generation) дают разные замены; контрольные суммы сгенерированных ИНН/СНИЛС/ОГРН сходятся.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_mapper.py -q</Command>
+        </Verification>
+      </T-001>
+      <T-002>
+        <Title>Корпуса: комбинаторная сборка и валидатор (M-CORPUS)</Title>
+        <DependsOn>T-001</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Корпус собирается из взвешенных компонент (фамилии/имена/отчества с родом, города/улицы); фикстурные компоненты в репозитории — синтетические, без реальных персон из демо-данных.</Criterion>
+          <Criterion>Валидатор отклоняет: битый формат, несошедшуюся контрольную сумму, дубль, значение длиннее объявленной длины колонки-потребителя.</Criterion>
+          <Criterion>Интерфейс LLM-генерации компонент с кэшем записанных ответов; юнит-тесты работают только на фикстурах, без сети.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_corpus.py -q</Command>
+        </Verification>
+      </T-002>
+      <T-003>
+        <Title>Демо-база с враждебными случаями и канарейками (M-DEMO-DB)</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>DDL 12-15 таблиц: вложенные и композитные FK, мягкая связь по ИНН без констрейнта, UNIQUE email, свободнотекстовые комментарии.</Criterion>
+          <Criterion>Враждебные случаи §7: f_115, city с полными адресами, attrs jsonb с плоскими ключами (телефоны, ФИО), склеенное поле «ФИО, тел. ...», грязный адрес с посторонним хвостом.</Criterion>
+          <Criterion>Канареечный набор: K известных образцов разных типов (в т.ч. в jsonb, в тексте, в склейке, хвост грязного адреса) с манифестом canaries.json для верификатора.</Criterion>
+          <Criterion>Масштаб параметризован (--scale, по умолчанию ~100 тыс. строк суммарно); генерация детерминирована по seed; docker compose поднимает demo-db и staging-db.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_demo_db.py -q</Command>
+          <Command>docker compose -f docker/docker-compose.yml up -d demo-db &amp;&amp; python -m sanitizer.demo seed --scale small</Command>
+        </Verification>
+      </T-003>
+      <T-004>
+        <Title>Профайлер каталога (M-PROFILER)</Title>
+        <DependsOn>T-003</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Интроспекция: таблицы, колонки, типы, длины, NOT NULL/UNIQUE/CHECK, FK-граф с композитными ключами; кардинальность, доля NULL, шаблоны значений, ключи первого уровня jsonb; доля разбираемости адресных строк.</Criterion>
+          <Criterion>Выход — сериализуемый снимок схемы; golden-тест против демо-базы; повторный запуск на неизменной базе даёт идентичный снимок.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_profiler.py -q</Command>
+        </Verification>
+      </T-004>
+      <T-005>
+        <Title>Классификатор: правила + Presidio + LLM по метаданным (M-CLASSIFIER)</Title>
+        <DependsOn>T-004</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Правиловые распознаватели РФ: ИНН/СНИЛС/ОГРН по контрольным суммам; паспорт и КПП только по формату+контекстным якорям — раздельные метрики.</Criterion>
+          <Criterion>Presidio на образцах значений; LLM-классификатор на именах/типах/статистике (в тестах — записанные ответы); расхождение детекторов или общая слепота → unresolved.</Criterion>
+          <Criterion>На размеченном наборе колонок демо-базы: recall чувствительных >= 0.98, precision >= 0.85; f_115 уходит в unresolved.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_classifier.py tests/integration/test_classifier_db.py -q</Command>
+        </Verification>
+      </T-005>
+      <T-006>
+        <Title>FK-замыкание и мягкие связи (M-FK-CLOSURE)</Title>
+        <DependsOn>T-004</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Классы эквивалентности колонок по объявленным FK (включая композитные) и мягким связям (вложенность доменов значений с порогом); стратегия назначается классу; конфликт стратегий внутри класса — ошибка валидации.</Criterion>
+          <Criterion>Мягкая связь demo-базы по ИНН обнаруживается и помечается «подозрение, подтвердить»; тест на синтетических схемах с композитными связями.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_fk_closure.py -q</Command>
+        </Verification>
+      </T-006>
+      <T-007>
+        <Title>Политика, модель плана и fail-closed валидация (M-POLICY)</Title>
+        <DependsOn>T-006</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Назначение стратегии и LLM-режима по осям чувствительность×кардинальность (§3.1, §5.3); человекочитаемый sanitization-plan.yaml с типом, стратегией, режимом, причиной по каждой колонке.</Criterion>
+          <Criterion>Валидация отклоняет: ПДн-тип в прямом режиме; fake при кардинальности &lt; 1000; null без явного подтверждения; jsonb без разметки ключей; конфликт класса эквивалентности; generalize без подтверждения на колонку.</Criterion>
+          <Criterion>Дифф плана против прежней версии показывает только новые/изменённые колонки; колонка вне плана при прогоне — ошибка с именем колонки.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_policy.py -q</Command>
+        </Verification>
+      </T-007>
+      <T-008>
+        <Title>Конвейер планирования на LangGraph с человеческим гейтом (M-PLAN-GRAPH)</Title>
+        <DependsOn>T-007</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Граф: profiler → (classifier ∥ presidio) → policy → fk-closure → corpus → interrupt-гейт; checkpointer сохраняет состояние; продолжение после аппрува через Command(resume).</Criterion>
+          <Criterion>Гейт показывает план и материал замен (direct-отображения и компоненты корпусов); в CI-режиме — автоаппрув с пометкой в run_log.</Criterion>
+          <Criterion>Повторный запуск на неизменной схеме не вызывает LLM (план переиспользуется); при изменённой схеме — дифф и точечный доаппрув.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_plan_graph.py -q</Command>
+        </Verification>
+      </T-008>
+      <T-009>
+        <Title>Исполнение, проход 1: Greenmask + Cmd-трансформер + run_log (M-EXECUTOR, M-RUNLOG)</Title>
+        <DependsOn>T-007</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Генерация config.yml Greenmask из плана: классы эквивалентности и идентичностные типы — только через Cmd; встроенный hash — только одиночные технические колонки; версия Greenmask зафиксирована в Dockerfile.</Criterion>
+          <Criterion>Cmd-процесс реализует построчный протокол Greenmask (json), вызывает mapper, укладывается в длину колонок; политика длины «обрезать/расширить/отказ» по плану.</Criterion>
+          <Criterion>run_log: (run_id, версии плана/мастер-соли/поколения/получателя/корпуса/кэша/инструмента, стадия, таблица, статус, checksum, ts); публикация дампа блокирована до полного done; проход 1 при падении перезапускается целиком.</Criterion>
+          <Criterion>Выход — валидный directory-дамп; pg_restore разворачивает его в staging без ошибок.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_executor.py -q</Command>
+        </Verification>
+      </T-009>
+      <T-010>
+        <Title>Исполнение, проход 2: свободный текст и схема sanitization поверх дампа (M-POSTPROC)</Title>
+        <DependsOn>T-009</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Обвязка читает COPY-файлы свободнотекстовых таблиц directory-дампа, прогоняет NER (spaCy ru) + regex-страховку (телефоны/email/ИНН/СНИЛС — 100% ловля форматов) + локальную LLM на фрагментах ниже порога с версионируемым кэшем; замены — тем же mapper по общему ключу идентичности.</Criterion>
+          <Criterion>Схема sanitization (notes/summary, коды причин, row_pk только пост-трансформационный) дописывается в дамп с правкой toc.dat; pg_restore разворачивает результат без ошибок.</Criterion>
+          <Criterion>Грязный адрес: колонка ниже порога разбираемости уходит в конвейер текста; нераспознанный хвост в выходе отсутствует; проход 2 возобновляем по таблицам через run_log.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_postproc.py -q</Command>
+        </Verification>
+      </T-010>
+      <T-011>
+        <Title>Верификатор на staging (M-VERIFIER)</Title>
+        <DependsOn>T-010</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Все проверки §7: канарейки K/K и 0/K включая хвост адреса; fake(x)!=x для direct/fake/generate с исключениями keep/shuffle/generalize; count(*); FK; энтропия &lt;=10% с исключениями по стратегиям; хи-квадрат топ-50; межколоночные инварианты; сквозная консистентность включая склейку и текст; воспроизводимость контрольных сумм двух прогонов; несвязываемость двух получателей.</Criterion>
+          <Criterion>Отчёт — таблица критериев со статусами и числами (markdown + json); красный любой критерий = ненулевой код выхода и блокировка публикации в run_log.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_verifier.py -q</Command>
+        </Verification>
+      </T-011>
+      <T-012>
+        <Title>CLI, сборка, README (M-CLI)</Title>
+        <DependsOn>T-011</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Команды: plan / approve / run / verify / demo-seed / report; вход подключением и вход дампом (разворачивание в staging); сообщения fail-closed называют колонку, причину и следующий шаг.</Criterion>
+          <Criterion>docker compose: инструмент, demo-db, staging-db, ollama; make demo — полный цикл одной командой; make demo-dump — сценарий входа из дампа.</Criterion>
+          <Criterion>README покрывает пять пунктов сопроводительного описания ТЗ и инструкцию запуска; .gitignore исключает дампы, кэши, соли.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_cli.py -q</Command>
+        </Verification>
+      </T-012>
+      <T-013>
+        <Title>Сквозной интеграционный прогон и доказательства приёмки</Title>
+        <DependsOn>T-012</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>make demo от чистого клона: планирование → гейт → проход 1 → проход 2 → верификация → отчёт, все критерии зелёные.</Criterion>
+          <Criterion>Двойной прогон подтверждает воспроизводимость; прогоны с recipient A и B — несвязываемость; make demo-dump проходит тот же контур от файла дампа.</Criterion>
+          <Criterion>Тест fail-closed: добавление колонки в демо-базу после аппрува роняет прогон с ожидаемой ошибкой.</Criterion>
+          <Criterion>Отчёт «до/после» сохранён в docs/demo-report.md как артефакт сдачи.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>make demo &amp;&amp; make demo-dump &amp;&amp; python -m pytest tests/e2e -q</Command>
+        </Verification>
+      </T-013>
+    </ImplementationPlan>
+  </C-MVP-SANITIZER>
+</GraceChangePlan>

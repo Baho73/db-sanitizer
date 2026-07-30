@@ -1,0 +1,15 @@
+{
+  "sensitive_categories": ["hr.positions.grade"],
+  "json_map": {
+    "hr.employees.attrs": {"phone": "phone", "emergency": "fio_full", "note": "keep"}
+  },
+  "overrides": {
+    "hr.employees.f_115": {"sem_type": "category", "strategy": "keep", "reason": "human: код грейда, не ПДн"},
+    "hr.contractors.city": {"sem_type": "address", "strategy": "fake", "llm_mode": "corpus", "reason": "human: имя колонки врёт, внутри полные адреса"},
+    "hr.employees.birth_date": {"confirmed": true},
+    "hr.employees.salary": {"strategy": "shuffle", "reason": "human: распределение сохранить, связь со строкой скрыть"},
+    "hr.payroll.amount": {"strategy": "shuffle", "reason": "human: как salary"},
+    "hr.employees.tab_no": {"confirmed": true}
+  },
+  "note": "Файл моделирует решения человека на гейте для демо-прогона; в интерактивном режиме те же решения вводятся на interrupt."
+}
