@@ -1,0 +1,45 @@
+<GraceChangeSpec graceVersion="4.0" status="applied">
+  <C-TEST-BACKFILL>
+    <Summary>Дописать пять тестовых файлов, объявленных планом C-MVP-SANITIZER и не созданных, измерить ими два незакрытых критерия приёмки §7 (полнота классификации; способность верификатора падать), исправить найденные при этом дефекты переносимости и сбора тестов, обновить свидетельства верификации под фактический прогон.</Summary>
+    <Problem>Отчёт по V-модели вскрыл расхождение между планом и репозиторием: команды верификации задач T-005, T-009, T-010, T-011, T-012 ссылались на файлы `tests/unit/test_cli.py`, `tests/integration/test_classifier_db.py`, `test_executor.py`, `test_postproc.py`, `test_verifier.py`, которых не существует. Финальный гейт этого не поймал: `--assertions final --run-commands` прогоняет только целевой `MustPassCommand` (`pytest tests/unit -q`), а пофайловые команды задач не исполняются. Следствием два критерия §7 остались декларациями: recall/precision классификатора не измерялись, а верификатор ни разу не проверялся на способность краснеть — при том что он уже однажды пропустил утечку адресов.</Problem>
+    <Goals>
+      <Goal>Создать все пять объявленных файлов с содержательными проверками, а не заглушками.</Goal>
+      <Goal>Измерить критерий §7 «полнота классификации чувствительных колонок» на размеченном наборе демо-базы.</Goal>
+      <Goal>Доказать негативными тестами, что верификатор падает на подсаженной утечке: канарейка в копии, возвращённое исходное значение, недостача строк.</Goal>
+      <Goal>Обновить свидетельства верификации в `.grace` под фактические числа и новые файлы.</Goal>
+    </Goals>
+    <Constraints>
+      <Constraint>Юнит-набор остаётся исполнимым без Postgres и LLM; интеграционные тесты пропускаются при отсутствии БД и greenmask, а не падают.</Constraint>
+      <Constraint>Негативные тесты верификатора обязаны возвращать копию в исходное состояние, чтобы не портить последующие прогоны.</Constraint>
+      <Constraint>Никаких реальных ПДн; разметка чувствительных колонок ведётся вручную и хранится в тесте.</Constraint>
+    </Constraints>
+    <NonGoals>
+      <NonGoal>Измерение производительности обоих проходов и recall NER на целевом домене - демо-масштаб для этого мал, остаётся в разрыве отчёта.</NonGoal>
+      <NonGoal>Тесты для M-REPORT: страница проверяется вручную в браузере и автопроверкой на канарейки.</NonGoal>
+      <NonGoal>Расширение размеченного набора до 200+ колонок, которых требует критерий §7 - демо-база даёт 69.</NonGoal>
+    </NonGoals>
+    <AcceptanceCriteria>
+      <Criterion>Все пять файлов существуют; полный набор (unit + integration + e2e) собирается и проходит.</Criterion>
+      <Criterion>Классификатор на размеченном наборе демо-базы даёт recall >= 0.98 и precision >= 0.85, метрики печатаются прогоном.</Criterion>
+      <Criterion>Три негативных теста верификатора красные при подсаженной утечке и зелёные после отката.</Criterion>
+      <Criterion>Свидетельства `.grace/verification/main.xml` соответствуют фактическим числам и упоминают новые файлы.</Criterion>
+      <Criterion>`grace lint` без ошибок; дрейф нулевой.</Criterion>
+    </AcceptanceCriteria>
+    <AffectedAreas>
+      <M-CLI />
+      <M-CLASSIFIER />
+      <M-VERIFIER />
+      <M-EXECUTOR />
+      <M-POSTPROC />
+      <M-MAPPER />
+    </AffectedAreas>
+    <VerificationIntent>
+      <ExpectedCommand>python -m pytest tests/unit tests/integration tests/e2e -q (в tool-контейнере); grace lint --path .</ExpectedCommand>
+      <ExpectedEvidence>103 passed; recall 1.000 / precision 0.958 в выводе test_classifier_db; три негативных теста верификатора зелёные; lint 0 ошибок, дрейф 0.</ExpectedEvidence>
+    </VerificationIntent>
+    <Assumptions>
+      <Assumption>Дефекты, найденные новыми тестами (os.environb только на POSIX; одноимённые модули в unit/ и integration/ ломали совместный сбор), исправляются в рамках этого же изменения - они обнаружены его же работой.</Assumption>
+      <Assumption>Спека оформлена постфактум (status=applied): работа выполнена по прямому указанию пользователя при составлении отчёта по V-модели.</Assumption>
+    </Assumptions>
+  </C-TEST-BACKFILL>
+</GraceChangeSpec>

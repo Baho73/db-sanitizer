@@ -2,7 +2,7 @@
   <VD-MAIN>
     <V-M-MAPPER>
       <Command>python -m pytest tests/unit/test_mapper.py -q</Command>
-      <Evidence>12 passed: детерминизм, консистентность форм одной сущности, fake(x)!=x, уникальность 100k через Фейстель-перестановку, контрольные суммы ИНН/СНИЛС/ОГРН, несвязываемость получателей, род фамилий.</Evidence>
+      <Evidence>13 passed: детерминизм, консистентность форм одной сущности, fake(x)!=x, уникальность 100k через Фейстель-перестановку, контрольные суммы ИНН/СНИЛС/ОГРН, несвязываемость получателей, род фамилий; отдельный тест на уникальность табельных и email под UNIQUE (2001 исходник -> 2001 замена) - хэш-в-диапазон ломал ограничение парадоксом дней рождения.</Evidence>
     </V-M-MAPPER>
     <V-M-CORPUS>
       <Command>python -m pytest tests/unit/test_corpus.py -q</Command>
@@ -17,8 +17,8 @@
       <Evidence>7 passed против демо-базы: счётчики, UNIQUE/NOT NULL, композитный FK через pg_constraint, ключи jsonb, метрика разбираемости адресов, детерминизм снимка.</Evidence>
     </V-M-PROFILER>
     <V-M-CLASSIFIER>
-      <Command>python -m pytest tests/unit/test_classifier.py -q</Command>
-      <Evidence>8 passed: типы с КС, паспорт только с якорем, f_115 слеп для обоих голосов -> unresolved, расхождение -> unresolved, PK -> technical, кэш LLM обязателен офлайн.</Evidence>
+      <Command>python -m pytest tests/unit/test_classifier.py tests/integration/test_classifier_db.py -q</Command>
+      <Evidence>8 + 5 passed. КРИТЕРИЙ §7 ИЗМЕРЕН на демо-базе: recall 1.000, precision 0.958 при порогах 0.98/0.85; размечено 23 чувствительных колонки из 69 (критерий просит набор >=200 - на реальной базе он должен быть шире). Пропусков ПДн нет; единственное «ложное» срабатывание - f_115, ушедшая в unresolved, то есть правильное поведение fail-closed. Подтверждено: типы с контрольной суммой распознаются правилами без LLM; колонка с врущим именем (city с полными адресами) не теряется.</Evidence>
     </V-M-CLASSIFIER>
     <V-M-FK-CLOSURE>
       <Command>python -m pytest tests/unit/test_fk_closure.py -q</Command>
@@ -33,16 +33,16 @@
       <Evidence>3 passed: interrupt-гейт останавливает и возобновляется через Command(resume), автоаппрув даёт валидный план с ожидаемыми стратегиями по враждебным случаям, повторный прогон при неизменной схеме - пустой дифф.</Evidence>
     </V-M-PLAN-GRAPH>
     <V-M-EXECUTOR>
-      <Command>python -m pytest tests/unit/test_executor.py -q; sanitizer.cli run (проход 1 в docker)</Command>
-      <Evidence>7 passed + живой greenmask dump v0.2.22: протокол json-строк (метаданные первой строкой пропускаются, SIGTERM->0), ФИО согласовано в строке, все стратегии, direct-промах падает fail-closed, конфиг без freetext-колонок, гейт публикации run_log.</Evidence>
+      <Command>python -m pytest tests/unit/test_executor.py tests/integration/test_executor.py -q</Command>
+      <Evidence>7 + 6 passed. Юнит: протокол json-строк (метаданные первой строкой пропускаются, SIGTERM-&gt;0), ФИО согласовано в строке, все стратегии, direct-промах падает fail-closed, конфиг без freetext-колонок, гейт публикации run_log. Интеграция против живой БД и настоящего greenmask v0.2.22: direct-карты инъективны и без тождественных замен, shuffle - перестановка мультимножества (сверено с источником), артефакты детерминированы, правило единого движка соблюдено (все колонки классов эквивалентности идут через Cmd), dump даёт валидный toc.dat и .dat.gz, без verify публикация запрещена.</Evidence>
     </V-M-EXECUTOR>
     <V-M-POSTPROC>
-      <Command>python -m pytest tests/unit/test_postproc.py -q; sanitizer.cli run (проход 2 в docker)</Command>
-      <Evidence>9 passed + живой проход 2 по дампу: regex-страховка (телефон/email/СНИЛС/паспорт), ФИО с инициалами консистентны полной форме, падежные якоря, LLM-кэш, деградации фиксируются; переписаны COPY-потоки 3 freetext-таблиц, sanitization.sql внутри дампа. РЕГРЕСС ЗАКРЫТ: адресные колонки заменяются целиком — сверка в базе показывает «п. Териберка, пер. Нагорный 28 кв 196… домофон 2519» → «Орловская Область, г. Анива, ул. Народная, д. 1, кв. 140»; два теста стерегут отсутствие любых фрагментов оригинала и детерминизм.</Evidence>
+      <Command>python -m pytest tests/unit/test_postproc.py tests/integration/test_postproc.py -q</Command>
+      <Evidence>10 + 6 passed. Юнит: regex-страховка (телефон/email/СНИЛС/паспорт), ФИО с инициалами консистентны полной форме, падежные якоря, LLM-кэш, деградации фиксируются; два теста стерегут полную замену адресной строки и её детерминизм. Интеграция против настоящего directory-дампа: разбор TOC, перезаписываются ровно freetext-таблицы, в потоке адресов не остаётся фрагментов оригинала (домофон, улица, квартира), sanitization.sql создан, архив читается pg_restore после перезаписи, проход 2 журналируется по таблицам. РЕГРЕСС: сверка в базе показывает «п. Териберка, пер. Нагорный 28 кв 196… домофон 2519» -&gt; «Орловская Область, г. Анива, ул. Народная, д. 1, кв. 140».</Evidence>
     </V-M-POSTPROC>
     <V-M-VERIFIER>
-      <Command>python -m pytest tests/unit/test_verifier.py -q; sanitizer.cli verify (в docker)</Command>
-      <Evidence>2 passed + живой отчёт на staging: см. out/verify-report.md - канарейки, fake(x)!=x, count(*), ограничения, энтропия, сквозная консистентность, мягкая связь.</Evidence>
+      <Command>python -m pytest tests/unit/test_verifier.py tests/integration/test_verifier.py -q</Command>
+      <Evidence>2 + 6 passed. Юнит: энтропия и форма отчёта. Интеграция - ГЛАВНОЕ: доказано, что верификатор УМЕЕТ ПАДАТЬ. Три негативных теста дают report.ok == False на подсаженной канарейке в копии, на возвращённом исходном значении ИНН (падает построчная fake(x)!=x) и на удалённой строке (падает контроль объёма); каждый возвращает копию в исходное состояние. Позитивный тест подтверждает прохождение чистой копии по всем 8 проверкам. Проверка добавлена после того, как верификатор однажды зеленел при утечке адресов из-за составной канарейки.</Evidence>
     </V-M-VERIFIER>
     <V-M-RUNLOG>
       <Command>python -m pytest tests/unit/test_executor.py::test_runlog_publish_gate -q</Command>
@@ -53,8 +53,8 @@
       <Evidence>Страница собрана (≈14 КБ), развёрнута на https://sanitizer.teamplan.ru за basic-auth. Проверено в браузере на живом сайте: 5 секций, 18+18 строк сравнения, 10 таблиц, горизонтального переполнения body нет, ошибок в консоли нет. Автопроверка: ни одна из 10 канареек не встречается в строках after; адресные фрагменты оригинала (посёлок, улица, квартира, домофон) отсутствуют.</Evidence>
     </V-M-REPORT>
     <V-M-CLI>
-      <Command>python -m sanitizer.cli --help; полный цикл demo-seed/plan/run/restore/verify в docker</Command>
-      <Evidence>Сквозной прогон от посева до отчёта верификации; сообщения fail-closed называют колонку и следующий шаг.</Evidence>
+      <Command>python -m pytest tests/unit/test_cli.py -q; полный цикл demo-seed/plan/run/restore/verify в docker</Command>
+      <Evidence>8 passed без БД и LLM: все шесть подкоманд зарегистрированы и имеют обработчик, дефолты плана и верификации, соль читается из окружения (разные получатели дают разные соли), разрешение каталога дампа выбирает свежий и падает на пустом. Тест сразу нашёл дефект переносимости: os.environb существует только на POSIX - на Windows CLI падал при старте, в контейнере не проявлялось; исправлено в cli.py и cmd_transformer.py. Сквозной прогон от посева до отчёта верификации пройден на обоих входах ТЗ.</Evidence>
     </V-M-CLI>
   </VD-MAIN>
 </GraceVerificationDocument>

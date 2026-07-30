@@ -1,0 +1,101 @@
+<GraceChangePlan graceVersion="4.0" status="applied">
+  <C-TEST-BACKFILL>
+    <IntentSummary>Закрыть разрыв между планом и репозиторием: дописать пять объявленных тестовых файлов, начав с тех, что превращают декларации §7 в измерения (классификатор, негативные тесты верификатора), затем интеграционные для исполнения, затем починить найденные дефекты и согласовать свидетельства. Порядок выбран по ценности: сначала то, что доказывает свойства системы, потом то, что фиксирует факт.</IntentSummary>
+    <BaselineAssertions>
+      <MustExist>
+        <Value>.grace/changes/archive/C-MVP-SANITIZER/plan.xml</Value>
+        <Value>sanitizer/verifier.py</Value>
+        <Value>sanitizer/classifier.py</Value>
+      </MustExist>
+    </BaselineAssertions>
+    <TargetAssertions>
+      <MustVerify>
+        <Module>M-CLI</Module>
+        <Module>M-CLASSIFIER</Module>
+        <Module>M-VERIFIER</Module>
+        <Module>M-EXECUTOR</Module>
+        <Module>M-POSTPROC</Module>
+      </MustVerify>
+      <MustPassCommand>
+        <Command>python -m pytest tests/unit -q</Command>
+      </MustPassCommand>
+    </TargetAssertions>
+    <DurableScope>
+      <VerificationAnchors>
+        <V-M-CLI />
+        <V-M-CLASSIFIER />
+        <V-M-VERIFIER />
+        <V-M-EXECUTOR />
+        <V-M-POSTPROC />
+        <V-M-MAPPER />
+      </VerificationAnchors>
+    </DurableScope>
+    <ObservedWriteScope>
+      <Glob>tests/**</Glob>
+      <File>sanitizer/cli.py</File>
+      <File>sanitizer/cmd_transformer.py</File>
+      <File>docs/module-status.md</File>
+      <File>README.md</File>
+    </ObservedWriteScope>
+    <ImplementationPlan>
+      <T-001>
+        <Title>Измерить критерий §7 «полнота классификации» интеграционным тестом</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>tests/integration/test_classifier_db.py против демо-базы: размеченный набор чувствительных колонок, расчёт recall и precision, пороги 0.98 и 0.85 как assert.</Criterion>
+          <Criterion>Метрики печатаются прогоном и сохраняются артефактом; f_115 подтверждена как unresolved, а не keep.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_classifier_db.py -q</Command>
+        </Verification>
+      </T-001>
+      <T-002>
+        <Title>Доказать, что верификатор умеет падать</Title>
+        <DependsOn>T-001</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>tests/integration/test_verifier.py: три негативных теста - подсаженная канарейка, возвращённое исходное значение ИНН, недостача строк; каждый обязан дать report.ok == False.</Criterion>
+          <Criterion>Каждый негативный тест возвращает копию в исходное состояние в finally.</Criterion>
+          <Criterion>Позитивный тест подтверждает, что чистая копия проходит все проверки.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_verifier.py -q</Command>
+        </Verification>
+      </T-002>
+      <T-003>
+        <Title>Интеграционные тесты исполнения и постобработки</Title>
+        <DependsOn>T-002</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>test_executor.py: инъективность direct-карт, shuffle как перестановка мультимножества, детерминизм артефактов, правило единого движка (классы только через Cmd), живой greenmask dump с валидным toc.dat.</Criterion>
+          <Criterion>test_postproc.py: разбор TOC, перезапись только freetext-таблиц, полная замена адресов в COPY-потоке, наличие sanitization.sql, восстановимость архива, журналирование по таблицам.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_executor.py tests/integration/test_postproc.py -q</Command>
+        </Verification>
+      </T-003>
+      <T-004>
+        <Title>Тест CLI и исправление найденных им дефектов</Title>
+        <DependsOn>T-003</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>tests/unit/test_cli.py без БД и LLM: все подкоманды зарегистрированы и имеют обработчик, дефолты, соль из окружения, разрешение каталога дампа с fail-closed на пустом каталоге.</Criterion>
+          <Criterion>Исправлено os.environb (только POSIX) в cli.py и cmd_transformer.py - CLI стартует на Windows.</Criterion>
+          <Criterion>Добавлены __init__.py в каталоги тестов: одноимённые модули в unit/ и integration/ больше не ломают совместный сбор.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit -q</Command>
+        </Verification>
+      </T-004>
+      <T-005>
+        <Title>Согласовать свидетельства верификации и отчёт по V-модели</Title>
+        <DependsOn>T-004</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Записи V-M-MAPPER, V-M-CLASSIFIER, V-M-EXECUTOR, V-M-POSTPROC, V-M-VERIFIER, V-M-CLI отражают фактические числа и новые файлы.</Criterion>
+          <Criterion>docs/module-status.md содержит матрицу модули × V-модель, таблицу измеренных критериев §7 и главный разрыв; из README есть ссылка.</Criterion>
+          <Criterion>grace lint без ошибок, дрейф нулевой.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit -q</Command>
+        </Verification>
+      </T-005>
+    </ImplementationPlan>
+  </C-TEST-BACKFILL>
+</GraceChangePlan>
