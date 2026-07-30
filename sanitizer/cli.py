@@ -34,7 +34,8 @@ DEF_COMPONENTS = "sanitizer/data/components-ru.json"
 
 
 def _salt() -> Salt:
-    return Salt(master=os.environb.get(b"MASTER_SALT", b"dev-master"),
+    # os.environb только на POSIX - на Windows CLI падал бы при старте
+    return Salt(master=os.environ.get("MASTER_SALT", "dev-master").encode(),
                 recipient=os.environ.get("RECIPIENT", "dev"),
                 generation=os.environ.get("GENERATION", "g1"),
                 version=int(os.environ.get("MASTER_SALT_VERSION", "1")))

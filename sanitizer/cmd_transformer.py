@@ -202,7 +202,7 @@ def main() -> int:
     ap.add_argument("--artifacts", default="out/artifacts")
     a = ap.parse_args()
 
-    salt = Salt(master=os.environb.get(b"MASTER_SALT", b"dev-master"),
+    salt = Salt(master=os.environ.get("MASTER_SALT", "dev-master").encode(),
                 recipient=os.environ.get("RECIPIENT", "dev"),
                 generation=os.environ.get("GENERATION", "g1"),
                 version=int(os.environ.get("MASTER_SALT_VERSION", "1")))
