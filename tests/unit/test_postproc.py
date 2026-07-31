@@ -20,9 +20,12 @@ def make_ts(llm=None):
 def test_regex_shield_catches_formats():
     ts = make_ts()
     out, _ = ts.sanitize_text("тел 8-999-777-00-02, почта ivan@corp.ru, СНИЛС 123-456-789 64")
-    assert "8-999-777-00-02" not in out and "999" not in out.split("почта")[0] or "+7" in out
-    assert "ivan@corp.ru" not in out
-    assert "123-456-789" not in out
+    # Утверждения раздельные и безусловные: дизъюнкция «A или B» оставалась
+    # зелёной при ослабленном поведении - достаточно было выполнить B.
+    assert "8-999-777-00-02" not in out
+    assert "+7" in out                       # телефон заменён, а не вырезан
+    assert "ivan@corp.ru" not in out and "@" in out
+    assert "123-456-789 64" not in out
 
 
 def test_fio_initials_replaced_consistently():
@@ -72,8 +75,11 @@ def test_ambiguous_fragment_uses_llm_cache():
 def test_no_llm_marks_degradation():
     ts = make_ts(llm=None)
     out, notes = ts.sanitize_text("передать Зюкозавру Хтоническому пакет")
-    # слово с фамильным суффиксом不 в словаре, LLM нет -> замена + пометка
-    assert notes == ["low_confidence_ner"] or out == "передать Зюкозавру Хтоническому пакет"
+    # Слово с фамильным суффиксом, но не из словаря; модели нет -> фрагмент
+    # остаётся неизменным И помечается деградацией. Оба условия обязательны:
+    # «пометка ИЛИ неизменность» проходила при любом из двух исходов.
+    assert notes == ["low_confidence_ner"]
+    assert out == "передать Зюкозавру Хтоническому пакет"
 
 
 def test_address_column_replaced_whole():

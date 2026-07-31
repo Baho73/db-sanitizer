@@ -77,6 +77,7 @@ class ClassifiedColumn:
 _PHONE_RE = re.compile(r"^\+?[78][\d\-\s()]{9,16}$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[a-zа-я]{2,}$", re.I)
 _PASSPORT_RE = re.compile(r"^\d{4}\s?\d{6}$")
+_PASSPORT_PART_RE = re.compile(r"^\d{4}$|^\d{6}$")   # серия либо номер отдельной колонкой
 _KPP_RE = re.compile(r"^\d{9}$")
 _NAMEISH_RE = re.compile(r"^[А-ЯЁ][а-яё\-]{2,}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -117,6 +118,12 @@ def rules_detect(col: ColumnInfo) -> tuple[SemType | None, float]:
     for st, pattern in ((SemType.PASSPORT, _PASSPORT_RE), (SemType.KPP, _KPP_RE)):
         if _ratio(s, lambda v: bool(pattern.match(v))) >= 0.9 and any(a in name for a in _CTX[st]):
             return st, 0.9
+    # Паспорт РАЗДЕЛЬНЫМИ колонками (серия 4 цифры, номер 6) - схема самой
+    # демо-базы. Слитный шаблон её не ловил, и колонки держались только на
+    # голосе LLM при заявленном «формат + контекстный якорь» (§4.3).
+    if _ratio(s, lambda v: bool(_PASSPORT_PART_RE.match(v))) >= 0.9 \
+            and any(a in name for a in _CTX[SemType.PASSPORT]):
+        return SemType.PASSPORT, 0.9
     if _ratio(s, lambda v: bool(_DATE_RE.match(v))) >= 0.9 and any(a in name for a in _CTX[SemType.BIRTH_DATE]):
         return SemType.BIRTH_DATE, 0.9
     if _ratio(s, lambda v: bool(_NAMEISH_RE.match(v))) >= 0.9 and col.cardinality > 20:

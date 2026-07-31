@@ -130,6 +130,22 @@ def test_luhn_generator_is_injective():
     assert len(outs) == len(cards) and all(luhn_ok(o) for o in outs)
 
 
+def test_split_passport_columns_detected_by_rules():
+    """Схема демо-базы держит паспорт двумя колонками; слитный шаблон их не ловил,
+    и распознавание опиралось только на голос модели."""
+    from sanitizer.classifier import rules_detect
+    from sanitizer.profiler import ColumnInfo
+
+    def col(name, samples):
+        return ColumnInfo("hr.e", name, "character varying", 10, True, False, False,
+                          100, 0.0, samples)
+
+    assert rules_detect(col("passport_series", ["4509", "4012", "7701"]))[0] == SemType.PASSPORT
+    assert rules_detect(col("passport_number", ["123456", "998877"]))[0] == SemType.PASSPORT
+    # без якоря в имени четырёхзначное число паспортом не объявляется
+    assert rules_detect(col("year_built", ["1998", "2004", "2011"]))[0] != SemType.PASSPORT
+
+
 def test_snils_replacement_keeps_checksum(tmp_path):
     out, _ = _ts(tmp_path).sanitize_text(gen_snils(S, "x"))
     assert valid_snils(normalize_digits(out))
