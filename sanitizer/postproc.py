@@ -41,7 +41,12 @@ _EMAIL_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9._%+-]+@[A-Za-zА-Яа-яЁё0-
 # Разделители допускаются одиночные - иначе «заявка 12345 от 20 05 2026»
 # склеилась бы в одно число.
 _ID_TOKEN_RE = re.compile(r"(?<![+\d])\d(?:[\s-]?\d){9,18}(?!\d)")
-_PASSPORT_RE = re.compile(r"(?<!\d)\d{4}\s\d{6}(?!\d)")
+# Паспорт РФ (4+6 цифр). Контрольной суммы у него нет - слой обязан покрывать
+# написания ФОРМАТОМ (ревью-2, Н3): пробел(ы), дефис и «серия 4501[,] номер
+# 123456». Голые 10 цифр подряд сознательно НЕ матчатся - это конфликт с
+# ИНН-10, и там решает контрольная сумма (_checksummed).
+_PASSPORT_RE = re.compile(
+    r"(?<!\d)(?:[Сс]ерия\s+)?\d{4}(?:[\s-]+,?\s*|,\s*)(?:[Нн]омер\s+)?\d{6}(?!\d)")
 # ФИО: «Фамилия И.О.», «Фамилия Имя (Отчество)» - словарь имён + фамильные суффиксы
 _FIO_INITIALS_RE = re.compile(r"\b([А-ЯЁ][а-яё]+(?:ов|ев|ин|ын|ова|ева|ина|ына|ский|ская|цкий|цкая|ко|ук|юк)а?)\s+([А-ЯЁ])\.\s?([А-ЯЁ])\.")
 _CAP_PAIR_RE = re.compile(r"\b([А-ЯЁ][а-яё]{2,})\s+([А-ЯЁ][а-яё]{2,})(?:\s+([А-ЯЁ][а-яё]{2,}))?\b")
@@ -154,12 +159,25 @@ class TextSanitizer:
         raw = m.group()
         if raw.strip(" 0123456789"):          # есть «+», скобка или дефис
             return self.mapper.phone(raw)
+        # Только цифры и пробелы: классификация по ГРУППИРОВКЕ, а не по
+        # сплющенным цифрам (ревью-2, minor). «8 950 420 61 18» - группировка
+        # телефона X XXX XXX XX XX, и ~1% таких строк проходил контрольную
+        # сумму СНИЛС и уезжал через gen_snils - расходясь со структурной
+        # колонкой, которая всегда идёт через mapper.phone. Прежний strip()
+        # это различие стирал.
+        if [len(g) for g in raw.split()] == [1, 3, 3, 2, 2]:
+            return self.mapper.phone(raw)
         by_checksum = self._checksummed(m)
         return by_checksum if by_checksum is not None else self.mapper.phone(raw)
 
     def _passport(self, m: re.Match) -> str:
-        """Формат «4 цифры пробел 6» - разметка паспорта; тот же довод."""
-        return gen_digits_like(self.salt, m.group())
+        """Ключ идентичности - 10 цифр series‖number через ОДНУ FPE-10
+        (ревью-2, Н3): структурная пара passport_series+passport_number
+        трансформируется тем же ключом, и текст обязан с ней совпасть.
+        Разделители исходника сохраняются (_reshape): «4509-123456» ->
+        «4812-654321», «серия 4501, номер 123456» -> «серия 4812, номер 654321»."""
+        fake = gen_digits_like(self.salt, normalize_digits(m.group()))
+        return _reshape(m.group(), fake)
 
     def _checksummed(self, m: re.Match) -> str | None:
         raw = m.group()
@@ -263,15 +281,36 @@ def _is_patronymic_like(w: str) -> bool:
 
 
 
+# Квотированный идентификатор в листинге pg_restore -l: кавычки внутри
+# раздвоены (тот же fmtId, что ident(), только в обратную сторону).
+_TOC_IDENT = r'(?:"((?:[^"]|"")+)"|([A-Za-z0-9_]+))'
+_TOC_DATA_RE = re.compile(
+    rf"^(\d+);\s+\d+\s+\d+\s+TABLE DATA\s+{_TOC_IDENT}\s+{_TOC_IDENT}(?:\s|$)")
+_TOC_DATA_LINE_RE = re.compile(r"^\d+;\s+\d+\s+\d+\s+TABLE DATA\s")
+
+
+def _toc_ident(quoted: str | None, plain: str | None) -> str:
+    return quoted.replace('""', '"') if quoted is not None else plain
+
+
 def toc_tables(dump_dir: Path, pg_restore: str = "pg_restore") -> dict[str, str]:
     """dumpid -> schema.table из листинга TOC (TABLE DATA)."""
     res = subprocess.run([pg_restore, "-l", str(dump_dir)], check=True,
                          capture_output=True, text=True)
     out: dict[str, str] = {}
     for line in res.stdout.splitlines():
-        m = re.match(r'^(\d+);\s+\d+\s+\d+\s+TABLE DATA\s+"?([\w]+)"?\s+"?([\w]+)"?', line)
-        if m:
-            out[m.group(1)] = f"{m.group(2)}.{m.group(3)}"
+        if not _TOC_DATA_LINE_RE.match(line):
+            continue
+        m = _TOC_DATA_RE.match(line)
+        if m is None:
+            # Fail-closed (ревью-2, Н2): молчаливый пропуск строки здесь
+            # означал, что таблица с квотированным именем («Odd Schema».
+            # «User Table») уезжала в дамп несанитизированной - регэксп
+            # «"?([\w]+)"?» сворачивал её в «Odd.Schema», и free_cols её
+            # не находил.
+            raise ValueError(f"toc_tables: не разобрана строка TABLE DATA: {line!r}")
+        out[m.group(1)] = f"{_toc_ident(m.group(2), m.group(3))}." \
+                          f"{_toc_ident(m.group(4), m.group(5))}"
     return out
 
 
@@ -305,14 +344,46 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
     state = json.loads(state_path.read_text(encoding="utf-8"))         if (resume and state_path.exists()) else {"notes": [], "summary": {}}
     notes_rows: list[tuple] = [tuple(n) for n in state["notes"]]
     summary: dict = dict(state["summary"])
+    files: dict = dict(state.get("files", {}))
     # Возобновляемость (§5.7) была объявлена и не реализована: журнал писался, но
     # не читался, и повторный вызов обрабатывал таблицу ВТОРОЙ раз - фейковый
     # телефон снова попадал под шаблон и заменялся на другой фейк.
     already_done = _completed_tables(runlog) if resume else set()
-    for dumpid, table in toc_tables(dump_dir, pg_restore).items():
+    toc = toc_tables(dump_dir, pg_restore)
+    # Сверка покрытия (ревью-2, Н2): freetext-таблица плана вне TOC раньше
+    # означала молчаливый пропуск - свободный текст уезжал в дамп как есть,
+    # без ошибки и без отметки degraded. Отказ с перечислением закрывает
+    # весь класс «таблица плана потерялась в дампе».
+    missing = sorted(set(free_cols) - set(toc.values()))
+    if missing:
+        raise ValueError("freetext-таблицы плана не найдены в TOC дампа: "
+                         + ", ".join(missing))
+    for dumpid, table in toc.items():
         if table not in free_cols:
             continue
-        if table in already_done and table in summary:
+        path = dump_dir / f"{dumpid}.dat.gz"
+        rec = files.get(table) if resume else None
+        if rec:
+            # Защита окна краха (ревью-2, Н1): замена файла неатомарна
+            # относительно записи state, поэтому решение о пропуске принимает
+            # не пара «журнал+summary» (они расходятся при обрыве), а хэш
+            # самого файла против записанных до/после.
+            digest = _sha256(path)
+            if digest == rec.get("post"):
+                continue          # таблица завершена прошлой попыткой
+            if digest != rec.get("pre"):
+                # Крах между tmp.replace и записью post-хэша: файл не совпадает
+                # ни с исходным, ни с завершённым состоянием. Молчаливая
+                # повторная обработка дала бы двойную трансформацию (телефон
+                # уезжал в третье значение) - отказ, а не «авось».
+                raise ValueError(
+                    f"{table}: файл дампа не совпадает ни с исходным, ни с "
+                    f"завершённым состоянием прошлого прогона (крах посреди "
+                    f"замены). Дальше: перезапустите прогон из свежего дампа "
+                    f"прохода 1 - повторная обработка запрещена, она дала бы "
+                    f"двойную трансформацию.")
+            # digest == pre: замена не состоялась, обрабатываем заново - безопасно
+        elif table in already_done and table in summary:
             continue          # итоги прошлой попытки уже в накопленном состоянии
         if runlog:
             runlog.mark("pass2", table, "running")
@@ -324,9 +395,13 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
         # row_pk уезжает наружу внутри sanitization.notes: подставить туда
         # первую попавшуюся колонку значит опубликовать её значение.
         pk_idx = order.index(plan.pk(table))
-        path = dump_dir / f"{dumpid}.dat.gz"
         tmp = path.with_name(path.name + ".tmp")
         rows, degraded = 0, 0
+        # pre-хэш персистируется ДО замены файла: иначе крах между replace и
+        # записью state выглядел бы при возобновлении как «таблица не
+        # обрабатывалась» - и получал бы вторую трансформацию.
+        files[table] = {"pre": _sha256(path)}
+        _write_state(state_path, notes_rows, summary, files)
         # Поток вместо списка строк в памяти: §5.5 говорит про 15 млн текстов,
         # а чтение файла целиком означало бы OOM ровно на заявленном масштабе.
         # Запись во временный файл с последующей атомарной заменой: падение
@@ -370,14 +445,48 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
                 out_fh.write("\t".join(fields) + "\n")
         tmp.replace(path)
         summary[table] = {"rows": rows, "degraded": degraded}
+        files[table] = {"pre": files[table]["pre"], "post": _sha256(path)}
+        # State и sanitization.sql переписываются после КАЖДОЙ таблицы, и state -
+        # атомарно (tmp+replace) (ревью-2, Н1): раньше state писался один раз в
+        # конце, и крах между mark("done") и той записью оставлял таблицу в
+        # already_done, но вне summary - условие пропуска выше было ложно, и
+        # перезапуск трансформировал её повторно (телефон уезжал в третье
+        # значение). sanitization.sql пишется ИЗ накопленного state, поэтому
+        # обязан переписываться в той же точке - иначе на диске жила бы пара
+        # «новый state / старый sql».
+        _write_state(state_path, notes_rows, summary, files)
+        _write_sanitization_sql(dump_dir, notes_rows, summary)
         if runlog:
             runlog.mark("pass2", table, "done")
 
-    state_path.write_text(json.dumps({"notes": [list(n) for n in notes_rows],
-                                      "summary": summary}, ensure_ascii=False),
-                          encoding="utf-8")
+    _write_state(state_path, notes_rows, summary, files)
     _write_sanitization_sql(dump_dir, notes_rows, summary)
     return summary
+
+
+def _sha256(path: Path) -> str:
+    """Хэш файла потоком - .dat.gz таблицы может быть велик, в память не читаем."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_state(state_path: Path, notes_rows: list[tuple], summary: dict,
+                 files: dict | None = None):
+    """Атомарная запись накопленного состояния прохода 2: tmp + replace.
+    Неатомарная запись при крахе оставила бы половину JSON, и возобновление
+    стартовало бы с битого summary - то есть снова с повторной обработки.
+    files: таблица -> {pre, post} хэши .dat.gz - защита окна краха (Н1)."""
+    tmp = state_path.with_name(state_path.name + ".tmp")
+    tmp.write_text(json.dumps({"notes": [list(n) for n in notes_rows],
+                               "summary": summary,
+                               "files": files or {}}, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(state_path)
 
 
 def _completed_tables(runlog) -> set[str]:
@@ -395,27 +504,50 @@ def _completed_tables(runlog) -> set[str]:
     return {t for t, status in last.items() if status == "done"}
 
 
-_UNESCAPE = {"t": "\t", "n": "\n", "r": "\r", "\\": "\\"}
+_UNESCAPE = {"t": "\t", "n": "\n", "r": "\r", "\\": "\\",
+             "b": "\b", "f": "\f", "v": "\v"}
 
 
 def _copy_unescape(s: str) -> str:
     """Один проход слева направо. Последовательные replace были неверны в
     принципе: «\\\\t» (литеральный слэш и буква t) сначала превращался в табуляцию,
-    и текст с обратным слэшем портился безвозвратно."""
+    и текст с обратным слэшем портился безвозвратно.
+    Помимо \\t\\n\\r pg_dump пишет \\b \\f \\v и восьмеричные \\ooo (ревью 2):
+    незнакомая последовательность после round-trip превращалась в литеральные
+    «\\»+«b» - молчаливая порча данных, которую не видит ни одна проверка."""
     out: list[str] = []
-    it = iter(s)
-    for ch in it:
+    i = 0
+    while i < len(s):
+        ch = s[i]
         if ch != "\\":
             out.append(ch)
+            i += 1
             continue
-        nxt = next(it, "")
-        out.append(_UNESCAPE.get(nxt, "\\" + nxt))
+        nxt = s[i + 1] if i + 1 < len(s) else ""
+        if nxt in _UNESCAPE:
+            out.append(_UNESCAPE[nxt])
+            i += 2
+            continue
+        # восьмеричный эскейп: 1-3 цифры (pg_dump пишет ровно три)
+        j = i + 1
+        while j < len(s) and j < i + 4 and s[j] in "01234567":
+            j += 1
+        if j > i + 1:
+            out.append(chr(int(s[i + 1:j], 8)))
+            i = j
+            continue
+        out.append("\\" + nxt)
+        i += 2 if nxt else 1
     return "".join(out)
 
 
 def _copy_escape(s: str) -> str:
+    # \b \f \v эскейпим обратно теми же последовательностями, что пишет
+    # pg_dump: литеральный 0x08 в COPY-потоке легален, но round-trip обязан
+    # быть байт-в-байт обратимым, а не «легальным в среднем»
     return (s.replace("\\", "\\\\").replace("\t", "\\t")
-             .replace("\n", "\\n").replace("\r", "\\r"))
+             .replace("\n", "\\n").replace("\r", "\\r")
+             .replace("\b", "\\b").replace("\f", "\\f").replace("\v", "\\v"))
 
 
 def _q(value: str) -> str:

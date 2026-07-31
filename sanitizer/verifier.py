@@ -74,6 +74,9 @@ def entropy(counts: list[int]) -> float:
 
 
 _TEXTLIKE = ("character varying", "text", "jsonb")
+# Числовые типы для leak-скана (ревью 2, §6.12): идентификатор, лежащий в
+# bigint/numeric колонке, текстовый фильтр _TEXTLIKE не видел вовсе.
+_NUMERIC_LIKE = ("smallint", "integer", "bigint", "numeric", "real", "double precision")
 
 
 # START_CONTRACT: verify
@@ -125,30 +128,21 @@ def verify(src_dsn: str, dst_dsn: str, plan: Plan, canary_manifest: Path,
         r.add("Канарейки в копии отсутствуют", not found_dst,
               f"утекли: {sorted(found_dst)}" if found_dst else "0 из K")
 
-        # 3. fake(x)!=x построчно для direct/fake/generate (§5.4)
-        offenders = []
-        for qualified, pc in plan.columns.items():
-            if pc.strategy not in ("direct", "fake", "generate"):
-                continue
-            table, col = qualified.rsplit(".", 1)
-            pk_expr = _pk_expr(pk_of, table)
-            src_vals = _col_by_pk(s, table, col, pk_expr)
-            dst_vals = _col_by_pk(d, table, col, pk_expr)
-            same = [pk for pk, v in src_vals.items()
-                    if v is not None and dst_vals.get(pk) == v]
-            if same:
-                offenders.append(f"{qualified}:{len(same)}")
-        r.add("Построчно fake(x) != x", not offenders,
-              "; ".join(offenders) if offenders else "все direct/fake/generate чисты")
+        # 3. fake(x)!=x для direct/fake/generate (§5.4): построчно там, где PK
+        # не тронут, и по мультимножествам там, где он трансформирован
+        _fake_ne_check(r, s, d, plan, pk_of)
 
         # 3b. Идентификаторы источника не встречаются в копии НИГДЕ - ни в
         # структурных колонках, ни в свободном тексте. Проверка не зависит от
         # канареек и от того, какие форматы умеет распознавать проход 2: она
         # сравнивает КОНТРОЛЬНЫЕ СУММЫ. Именно её отсутствие позволило 783 СНИЛС
         # уехать в копию при девяти зелёных проверках (разбор 5, находка 1).
-        leaked = _identifier_leak(s, d, plan, text_cols)
+        # Сканируются и числовые колонки (::text): ИНН в bigint-колонке иначе
+        # оставался вне охвата (ревью 2, §6.12).
+        scan_cols = _text_columns(s, schema, _TEXTLIKE + _NUMERIC_LIKE)
+        leaked = _identifier_leak(s, d, plan, scan_cols)
         r.add("Идентификаторы источника отсутствуют в копии (по контрольным суммам)",
-              not leaked, "; ".join(leaked[:5]) if leaked else "ИНН/СНИЛС/ОГРН источника не найдены")
+              not leaked, "; ".join(leaked[:5]) if leaked else "ИНН/СНИЛС/ОГРН/паспорт источника не найдены")
 
         # 3c. Деградации прохода 2 - это фрагменты, оставленные без изменений.
         # Их допустимое число объявляется планом и проходит гейт, а не молчит.
@@ -226,14 +220,16 @@ def _corpus_ceiling(pc, s, table: str, col: str,
 
 
 # START_CONTRACT: _identifier_leak
-#   PURPOSE: Найти в копии значения ИНН/СНИЛС/ОГРН источника, независимо от их
-#            написания. Опознание идёт по контрольной сумме, поэтому проверка не
-#            наследует слепоту того слоя, который она проверяет.
-#   INPUTS: { s: курсор источника, d: курсор копии, plan, text_cols }
+#   PURPOSE: Найти в копии значения ИНН/СНИЛС/ОГРН/паспорта источника, независимо
+#            от их написания. Опознание идёт по контрольной сумме, поэтому
+#            проверка не наследует слепоту того слоя, который она проверяет.
+#            Паспорт контрольной суммы не имеет - ищутся точные 10 цифр
+#            series‖number из пар колонок плана (ревью 2, Н3).
+#   INPUTS: { s: курсор источника, d: курсор копии, plan, scan_cols }
 #   OUTPUTS: { list[str] - «таблица.колонка: сколько значений» }
 #   SIDE_EFFECTS: чтение обеих БД
 # END_CONTRACT: _identifier_leak
-def _identifier_leak(s, d, plan: Plan, text_cols: dict[str, list[str]]) -> list[str]:
+def _identifier_leak(s, d, plan: Plan, scan_cols: dict[str, list[str]]) -> list[str]:
     from psycopg import sql
 
     from sanitizer.mapper import normalize_digits, valid_inn, valid_ogrn, valid_snils
@@ -247,11 +243,16 @@ def _identifier_leak(s, d, plan: Plan, text_cols: dict[str, list[str]]) -> list[
                   .format(c=ident(col), t=ident(table)))
         wanted |= {normalize_digits(r[0]) for r in s.fetchall()}
     wanted = {w for w in wanted if valid_inn(w) or valid_snils(w) or valid_ogrn(w)}
+    # Паспорт добавляется ПОСЛЕ фильтра контрольных сумм: у него её нет, и
+    # отбрасывать 10 цифр по чужим критериям значит оставить его вне контроля
+    # (ревью 2, §6.3 п.3). Ложное срабатывание здесь - это не ложное
+    # срабатывание: 10 цифр исходного паспорта доехали до копии.
+    wanted |= _passport_wanted(s, plan)
     if not wanted:
         return []
 
     found: list[str] = []
-    for table, cols in sorted(text_cols.items()):
+    for table, cols in sorted(scan_cols.items()):
         for col in cols:
             d.execute(sql.SQL("SELECT {c}::text FROM {t} WHERE {c} IS NOT NULL")
                       .format(c=ident(col), t=ident(table)))
@@ -263,6 +264,55 @@ def _identifier_leak(s, d, plan: Plan, text_cols: dict[str, list[str]]) -> list[
             if hits:
                 found.append(f"{table}.{col}: {hits}")
     return found
+
+
+def _collect_passport_pairs(plan: Plan) -> dict[str, tuple[str, str]]:
+    """Таблица -> (колонка серии, колонка номера) для пар вида
+    passport_series / passport_number. Пара - это общий ПРЕФИКС: «X_series»
+    ищет «X_number», а не любую колонку с подстрокой «number» - иначе
+    doc_number (полный 10-значный документ) молча перетирал номер пары.
+    Одиночная колонка без пары не собирается: склеивать её не с чем, а 4 или
+    6 цифр как «паспорт» - источник ложных срабатываний."""
+    cols_by_table: dict[str, list[str]] = {}
+    for qualified, pc in plan.columns.items():
+        if pc.sem_type != "passport":
+            continue
+        table, col = qualified.rsplit(".", 1)
+        cols_by_table.setdefault(table, []).append(col)
+    out: dict[str, tuple[str, str]] = {}
+    for table, cols in cols_by_table.items():
+        lowered = {c.lower(): c for c in cols}
+        for low, col in lowered.items():
+            if "series" not in low:
+                continue
+            partner = lowered.get(low.split("series")[0] + "number")
+            if partner:
+                out[table] = (col, partner)
+                break
+    return out
+
+
+def _passport_wanted_values(rows) -> set[str]:
+    """Склейки series‖number -> канонические 10 цифр; всё остальное - мусор
+    (NULL-части, недлинные номера) и в wanted не попадает."""
+    from sanitizer.mapper import normalize_digits
+
+    return {d for r in rows if r is not None
+            for d in (normalize_digits(str(r)),) if len(d) == 10}
+
+
+def _passport_wanted(s, plan: Plan) -> set[str]:
+    """10-значные паспорта источника из пар колонок series‖number. Ключ
+    идентичности тот же, что в текстовом слое прохода 2 (ревью 2, Н3)."""
+    from psycopg import sql
+
+    wanted: set[str] = set()
+    for table, (series, number) in sorted(_collect_passport_pairs(plan).items()):
+        s.execute(sql.SQL("SELECT {a}::text || {b}::text FROM {t} "
+                          "WHERE {a} IS NOT NULL AND {b} IS NOT NULL")
+                  .format(a=ident(series), b=ident(number), t=ident(table)))
+        wanted |= _passport_wanted_values(r[0] for r in s.fetchall())
+    return wanted
 
 
 def _degradation_check(r: VerifyReport, d, plan: Plan):
@@ -363,12 +413,12 @@ def _tables(cur, schema: str) -> list[str]:
     return [r[0] for r in cur.fetchall()]
 
 
-def _text_columns(cur, schema: str) -> dict[str, list[str]]:
+def _text_columns(cur, schema: str, types=_TEXTLIKE) -> dict[str, list[str]]:
     # список типов уезжает параметром, а не repr кортежа: прежняя склейка
     # работала случайно и на кортеже из одного элемента давала «('text',)»
     cur.execute("SELECT table_schema || '.' || table_name, column_name "
                 "FROM information_schema.columns WHERE table_schema = %s "
-                "AND data_type = ANY(%s)", (schema, list(_TEXTLIKE)))
+                "AND data_type = ANY(%s)", (schema, list(types)))
     out: dict[str, list[str]] = {}
     for t, c in cur.fetchall():
         out.setdefault(t, []).append(c)
@@ -425,6 +475,82 @@ def _col_by_pk(cur, table: str, col: str, pk_expr) -> dict:
     return dict(cur.fetchall())
 
 
+def _col_multiset(cur, table: str, col: str) -> dict[str, int]:
+    """Мультимножество значений колонки: значение -> кратность."""
+    from psycopg import sql
+
+    cur.execute(sql.SQL("SELECT {c}::text, count(*) FROM {t} GROUP BY {c}")
+                .format(c=ident(col), t=ident(table)))
+    return {v: n for v, n in cur.fetchall()}
+
+
+def _multiset_overlap(src: dict[str, int], dst: dict[str, int]) -> list[str]:
+    """Значения, присутствующие в мультимножествах ОБЕИХ сторон. NULL исключён:
+    он не трансформируется и законно встречается и в источнике, и в копии.
+    Кратности не сравниваются: у биективной перестановки (generate) они совпадают
+    по построению, а предмет проверки - сам факт выживания исходного значения."""
+    return sorted(v for v in src if v is not None and v in dst)
+
+
+# START_CONTRACT: _fake_ne_check
+#   PURPOSE: Проверка 3 §5.4 «fake(x)!=x» для стратегий direct/fake/generate.
+#            Таблица с нетронутым PK сверяется построчно по ключу; таблица с
+#            трансформированным PK - дизъюнктностью мультимножеств значений
+#            (ключа источника в копии нет, построчная сверка вакуумна -
+#            ревью 2, находка 10). Таблица без PK - красная проверка в отчёте,
+#            а не исключение, обрывающее весь прогон (ревью 2, §6.12).
+#   INPUTS: { r: VerifyReport, s: курсор источника, d: курсор копии, plan, pk_of }
+#   OUTPUTS: { none - отчёт пополняется }
+#   SIDE_EFFECTS: чтение обеих БД
+# END_CONTRACT: _fake_ne_check
+def _fake_ne_check(r: VerifyReport, s, d, plan: Plan, pk_of: dict[str, list[str]]):
+    by_table: dict[str, list[tuple[str, str]]] = {}
+    for qualified, pc in plan.columns.items():
+        if pc.strategy not in ("direct", "fake", "generate"):
+            continue
+        table, col = qualified.rsplit(".", 1)
+        by_table.setdefault(table, []).append((col, qualified))
+
+    offenders, no_pk = [], []
+    for table, cols in sorted(by_table.items()):
+        pk_cols = pk_of.get(table)
+        if not pk_cols:
+            # прежний _pk_expr бросал здесь ValueError и обрывал ВЕСЬ прогон:
+            # одна таблица без PK отменяла канарейки, FK и энтропию заодно
+            no_pk.append(table)
+            continue
+        touched = any(plan.columns[f"{table}.{c}"].strategy not in ("keep", "unresolved")
+                      for c in pk_cols if f"{table}.{c}" in plan.columns)
+        if touched:
+            # PK трансформирован: ключей источника в копии не существует,
+            # dst_vals.get(pk) всегда None и построчная сверка зеленела на пустом
+            # пересечении. Ключу-ПДн политика разрешает только generate -
+            # биективную перестановку (policy.py), а у биекции мультимножества
+            # значений источника и копии обязаны быть дизъюнктны: это и есть
+            # fake(x)!=x без ложных срабатываний прежней «проверки 3».
+            # Построчная сверка ОСТАЛЬНЫХ колонок такой таблицы по расходящемуся
+            # PK вакуумна тем же образом - поэтому они проверяются здесь же.
+            for col, qualified in cols:
+                overlap = _multiset_overlap(_col_multiset(s, table, col),
+                                            _col_multiset(d, table, col))
+                if overlap:
+                    offenders.append(f"{qualified}:{len(overlap)}")
+        else:
+            pk_expr = _pk_expr(pk_of, table)
+            for col, qualified in cols:
+                src_vals = _col_by_pk(s, table, col, pk_expr)
+                dst_vals = _col_by_pk(d, table, col, pk_expr)
+                same = [pk for pk, v in src_vals.items()
+                        if v is not None and dst_vals.get(pk) == v]
+                if same:
+                    offenders.append(f"{qualified}:{len(same)}")
+    r.add("Построчно fake(x) != x", not offenders,
+          "; ".join(offenders) if offenders else "все direct/fake/generate чисты")
+    if no_pk:
+        r.add("Первичный ключ у трансформируемых таблиц", False,
+              "нет PK, сверка fake(x)!=x невозможна: " + ", ".join(no_pk))
+
+
 def _col_entropy(cur, table: str, col: str) -> float:
     from psycopg import sql
 
@@ -432,8 +558,13 @@ def _col_entropy(cur, table: str, col: str) -> float:
     return entropy([r[0] for r in cur.fetchall()])
 
 
+# Схема сравнивается через pg_namespace.nspname, как в profiler._FK_SQL:
+# relnamespace::regnamespace::text на квотированной схеме («Odd Schema») даёт
+# строку с кавычками, параметр - без; 0 == 0, и проверка зеленела на слепом
+# сравнении (ревью 2, §6.12).
 _FK_COUNT = ("SELECT count(*) FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid "
-             "WHERE c.contype IN ('f','u','p') AND t.relnamespace::regnamespace::text = %s")
+             "JOIN pg_namespace n ON n.oid = t.relnamespace "
+             "WHERE c.contype IN ('f','u','p') AND n.nspname = %s")
 
 
 def column_checksums(dsn: str, plan: Plan, schema: str | None = None) -> dict[str, str]:

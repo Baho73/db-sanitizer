@@ -10,6 +10,7 @@
 # START_MODULE_MAP
 #   PlanState - состояние графа планирования
 #   apply_overrides - наложить разметку человека по белому списку полей
+#   gate_payload - нагрузка гейта с хэшем черновика (привязка approve)
 #   build_graph - собрать StateGraph с checkpointer
 #   run_planning - выполнить до гейта; вернуть паузу или готовый план
 #   resume_approved - продолжить после аппрува (Command(resume=...))
@@ -133,6 +134,23 @@ def _node_classify_and_assign(state: PlanState) -> dict:
     return {"diff": diff, "errors": validate_plan(plan, snap)}
 
 
+def gate_payload(state: PlanState) -> dict:
+    """Полезная нагрузка гейта. Хэш черновика - привязка approve к тому, что
+    человек ЧИТАЛ: черновик лежит на диске и параллельный plan мог его
+    перезаписать после показа; без хэша approve подписывал бы подменённый
+    план от имени human (ревью 2, Н4)."""
+    import hashlib
+
+    draft = Path(state["plan_path"]).with_suffix(".draft.yaml")
+    return {
+        "plan_draft": str(draft),
+        "draft_sha256": hashlib.sha256(draft.read_bytes()).hexdigest()
+        if draft.exists() else "",
+        "diff": state.get("diff", {}),
+        "validation_errors": state.get("errors", []),
+    }
+
+
 def _node_gate(state: PlanState) -> dict:
     """Человеческий гейт. interrupt() останавливает граф с сохранением состояния;
     продолжение - Command(resume={"approve": bool, "confirm": [колонки]})."""
@@ -140,11 +158,7 @@ def _node_gate(state: PlanState) -> dict:
         # CI-режим: подтверждения берутся из конфига и помечаются машинными -
         # в самом плане видно, что человека на гейте не было
         return {"approved": True, "confirm": list(state.get("confirm") or []), "confirmed_by": "ci"}
-    answer = interrupt({
-        "plan_draft": str(Path(state["plan_path"]).with_suffix(".draft.yaml")),
-        "diff": state.get("diff", {}),
-        "validation_errors": state.get("errors", []),
-    })
+    answer = interrupt(gate_payload(state))
     return {"approved": bool(answer.get("approve")),
             "confirm": list(answer.get("confirm") or []), "confirmed_by": "human"}
 
@@ -177,11 +191,15 @@ def build_graph(checkpoint_path: Path | None = None):
     свойства (§4.5 «продолжение хоть через сутки») и выбирался LangGraph."""
     if checkpoint_path is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        import os
         import sqlite3
 
         from langgraph.checkpoint.sqlite import SqliteSaver
 
         conn = sqlite3.connect(checkpoint_path, check_same_thread=False)
+        # В blob чекпойнта лежит DSN с паролем - файл не должен быть читаем
+        # всеми (ревью 2: создавался 0666 и уезжал на хост через bind-mount)
+        os.chmod(checkpoint_path, 0o600)
         return _compile(SqliteSaver(conn))
     return _compile(MemorySaver())
 

@@ -187,7 +187,14 @@ def _shuffle_map(cur, plan: Plan, table: str, col: str, perms: dict) -> dict[str
     pk = _single_pk(plan, table)
     entity, group = _entity_column(plan, table, pk)
     perm = perms[group]["perm"]
-    cur.execute(sql.SQL("SELECT {k}::text, {e}::text, {c}::text FROM {t} ORDER BY {e}, {k}")
+    # NULL отфильтрован на стороне БД: трансформер пропускает NULL-строки по
+    # флагу n, а без фильтра NULL попадал в список доноров и мигрировал в
+    # не-NULL строку как {"d": null, "n": false} - невалидное состояние
+    # протокола (ревью 2, находка «NULL в shuffle»). Доля NULL сохраняется
+    # всегда; мультимножество не-NULL значений - при условии из _induced
+    # (равное число строк на сущность).
+    cur.execute(sql.SQL("SELECT {k}::text, {e}::text, {c}::text FROM {t} "
+                        "WHERE {c} IS NOT NULL ORDER BY {e}, {k}")
                 .format(k=ident(pk), e=ident(entity), c=ident(col), t=ident(table)))
     by_entity: dict[str, list[tuple[str, str]]] = {}
     for row_pk, ent, value in cur.fetchall():

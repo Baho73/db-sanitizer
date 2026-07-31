@@ -55,7 +55,12 @@ class RunLog:
         self.db.commit()
 
     # START_CONTRACT: publishable
-    #   PURPOSE: Гейт публикации (§5.7): все стадии run завершены и без failed.
+    #   PURPOSE: Гейт публикации (§5.7): прогон ПОЛНЫЙ (pass1 и verify завершены;
+    #            pass2 - для всех таблиц, по которым он начинался), все записи
+    #            done и метаданные строк однородны. Проверка «все записанные done»
+    #            без требования стадий открывала публикацию журналу с единственной
+    #            строкой verify=done, а verify чужим планом/солью под тем же
+    #            run_id был неотличим от честного (ревью 2, Н5).
     #   INPUTS: { run_id: str }
     #   OUTPUTS: { bool }
     #   SIDE_EFFECTS: none
@@ -69,7 +74,31 @@ class RunLog:
             "             AND r2.stage=run_log.stage AND r2.tbl=run_log.tbl)", (run_id,)).fetchall()
         if not rows or any(s != "done" for *_, s in rows):
             return False
-        return "verify" in {stage for stage, *_ in rows}
+        stages = {stage for stage, *_ in rows}
+        # pass2 может честно отсутствовать (нет freetext-таблиц); pass1 и verify -
+        # обязаны: без pass1 публиковать нечего, без verify - запрещено
+        if not {"pass1", "verify"} <= stages:
+            return False
+        return not self.meta_mismatches(run_id)
+
+    def run_meta(self, run_id: str) -> dict | None:
+        """Метаданные первой записи прогона: план, соль, получатель."""
+        row = self.db.execute(
+            "SELECT plan_version, master_salt_version, salt_generation, recipient_id "
+            "FROM run_log WHERE run_id=? ORDER BY rowid LIMIT 1", (run_id,)).fetchone()
+        keys = ("plan_version", "master_salt_version", "salt_generation", "recipient_id")
+        return dict(zip(keys, row)) if row else None
+
+    def meta_mismatches(self, run_id: str) -> list[str]:
+        """Строки прогона с метаданными, отличными от первой записи. Однородность -
+        это и есть связка «verify относится к ЭТОМУ прогону»: verify, записанный
+        с другим планом или солью под тем же run_id, здесь всплывёт."""
+        rows = self.db.execute(
+            "SELECT DISTINCT plan_version, master_salt_version, salt_generation, "
+            "recipient_id FROM run_log WHERE run_id=?", (run_id,)).fetchall()
+        if len(rows) <= 1:
+            return []
+        return [f"разные метаданные строк прогона: {rows}"]
 
     def entries(self, run_id: str) -> list[tuple]:
         # порядок по rowid, как в publishable: часы контейнеров ненадёжны

@@ -216,7 +216,20 @@ def classifier_ask(client: LLMClient, meta: dict, allowed: list[str],
         sem, conf = value
         if sem is not None and sem not in allowed:
             sem, conf = None, 0.0          # тип вне словаря = «не знаю»
-        out[column] = [sem, float(conf) if sem else 0.0]
+        if sem is None:
+            out[column] = [None, 0.0]
+            continue
+        # Уверенность валидируется, а не конвертируется вслепую: «высокая»
+        # роняла планирование на float(), а conf=42 молча доминировал над
+        # честными голосами в [0,1] (ревью 2, §6.11 п.2). Цена обоих случаев -
+        # один потерянный голос, колонку разберёт человек.
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            continue                       # нечисловая уверенность - голос отбрасывается
+        if not 0.0 <= conf <= 1.0:
+            continue                       # вне диапазона - отбрасывается, не клампится
+        out[column] = [sem, conf]
     return out
 
 
@@ -309,8 +322,33 @@ def direct_map(client: LLMClient, values: list[str]) -> dict[str, str]:
     )
     raw = client.json_chat(prompt, "Ты переименовываешь организации. Только JSON.",
                            role="direct")
-    return {k: str(v) for k, v in (raw or {}).items()
-            if k in set(values) and str(v).strip() and str(v) != k}
+    known = set(values)
+    return {k: str(v) for k, v in _as_mapping(raw)
+            if k in known and str(v).strip() and str(v) != k}
+
+
+def _as_mapping(raw):
+    """Ответ роли 3 -> пары (исходное, замена).
+
+    Модель может вернуть массив вместо объекта, и (raw or {}).items() падал на
+    нём AttributeError посреди исполнения (ревью 2, §6.11 п.1). Неразобранное
+    молча пропускается: пробелы карты достраивает детерминированный
+    corpus-fallback в prepare_artifacts, это безопаснее падения прогона."""
+    if isinstance(raw, dict):
+        return list(raw.items())
+    pairs = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if len(item) == 1:
+            # самая частая форма у локальных моделей: [{"исходное": "замена"}]
+            pairs.extend(item.items())
+        else:
+            src = item.get("source") or item.get("original") or item.get("исходное")
+            dst = item.get("replacement") or item.get("fake") or item.get("замена")
+            if src is not None and dst is not None:
+                pairs.append((src, dst))
+    return pairs
 
 
 # START_CONTRACT: ner_verdict

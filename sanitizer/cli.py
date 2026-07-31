@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -66,6 +67,16 @@ def cmd_plan(a) -> int:
 
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
     graph = build_graph(Path(a.checkpoint))
+    gcfg = {"configurable": {"thread_id": a.thread}}
+    if graph.get_state(gcfg).next:
+        # Повторный plan на треде с висящим гейтом молча перезапускал граф с
+        # START и перезаписывал и чекпойнт, и черновик - а approve потом
+        # подписывал НЕ ТО, что человек читал (ревью 2, Н4). Отказ, а не
+        # молчаливая подмена.
+        print(f"ОТКАЗ: прогон {a.thread!r} уже остановлен на гейте и ждёт решения.")
+        print("Дальше: sanitizer approve --thread ... [--confirm ...] или "
+              "--reject; новое планирование - под другим --thread.")
+        return 1
     state = {"dsn": a.dsn, "schema": a.schema, "llm_cache": a.llm_cache,
              "llm_available": bool(cfg.get("llm_available")),
              "json_map": cfg.get("json_map", {}),
@@ -116,9 +127,23 @@ def cmd_approve(a) -> int:
 
     graph = build_graph(Path(a.checkpoint))
     cfg = {"configurable": {"thread_id": a.thread}}
-    if not graph.get_state(cfg).next:
+    gstate = graph.get_state(cfg)
+    if not gstate.next:
         print(f"Нечего подтверждать: прогон {a.thread!r} не остановлен на гейте.")
         print("Дальше: запустите sanitizer plan, он остановится и назовёт черновик.")
+        return 1
+    # Привязка к прочитанному (ревью 2, Н4): черновик на диске мог быть
+    # перезаписан после показа человеку - approve подписывает только тот
+    # черновик, чей хэш зафиксирован в нагрузке гейта.
+    payload = gstate.tasks[0].interrupts[0].value
+    expected = payload.get("draft_sha256", "")
+    draft = Path(payload["plan_draft"])
+    actual = hashlib.sha256(draft.read_bytes()).hexdigest() if draft.exists() else ""
+    if expected and actual != expected:
+        print("ОТКАЗ: черновик на диске изменился после показа на гейте")
+        print(f"  ({draft}). Подтвердить можно только прочитанную версию.")
+        print("Дальше: --reject и новое планирование, либо перечитайте и "
+              "сверьте изменения.")
         return 1
     answer = {"approve": not a.reject, "confirm": list(a.confirm or [])}
     out = graph.invoke(Command(resume=answer), cfg)
@@ -132,6 +157,51 @@ def cmd_approve(a) -> int:
         return 1
     print(f"Подтверждено человеком. План записан: {out.get('plan_path', 'см. --plan')}")
     return 0
+
+
+# START_CONTRACT: _resume_or_start_run
+#   PURPOSE: run_id прогона: возобновить прерванный либо начать новый. Без
+#            возобновления каждый перезапуск CLI порождал новый run_id, журнал
+#            прошлого прогона для _completed_tables был пуст - и проход 2
+#            обрабатывал уже санитизированные таблицы второй раз (ревью 2, Н1).
+#   INPUTS: { rl: RunLog, work: каталог прогона, plan, salt }
+#   OUTPUTS: { str - run_id }
+#   SIDE_EFFECTS: SystemExit при висячем прогоне с чужими отпечатками
+# END_CONTRACT: _resume_or_start_run
+def _resume_or_start_run(rl: RunLog, work: Path, plan: Plan, salt: Salt) -> str:
+    rid_file = work / "run_id"
+    if rid_file.exists():
+        rid = rid_file.read_text(encoding="utf-8").strip()
+        meta = rl.run_meta(rid)
+        if meta and not rl.publishable(rid):
+            current = {"plan_version": plan.schema_fingerprint,
+                       "master_salt_version": salt.version,
+                       "salt_generation": salt.generation,
+                       "recipient_id": salt.recipient}
+            if meta == current:
+                print(f"возобновляю прерванный прогон run_id={rid}")
+                rl.meta = {"run_id": rid, **current, "corpus_version": "fixtures-1",
+                           "cache_version": "none", "tool_version": "0.1.0"}
+                return rid
+            # Продолжить чужой прогон нельзя (соль/план другие - замены не
+            # сойдутся), затереть его молча - тоже: это чей-то незаконченный run.
+            raise SystemExit(
+                f"В {work} висит прерванный прогон {rid} с ДРУГИМИ отпечатками "
+                f"плана/соли (журнал: {meta}).\nДальше: либо верните тот план и "
+                f"соль и повторите run (прогон возобновится), либо очистите "
+                f"рабочий каталог / задайте другой --work.")
+    return rl.start_run(plan.schema_fingerprint, salt.recipient, salt.generation,
+                        master_salt_version=salt.version)
+
+
+def _read_run_file(work: Path, name: str) -> str:
+    """Файл-маркер прогона. Отсутствие - это «run ещё не было», а не повод
+    уронить команду traceback'ом (ревью 2, UX fail-closed)."""
+    f = work / name
+    if not f.exists():
+        raise SystemExit(f"в {work} нет {name} - прогон run ещё не выполнялся "
+                         f"или выполнялся с другим --work.\nДальше: сначала run.")
+    return f.read_text(encoding="utf-8").strip()
 
 
 def cmd_run(a) -> int:
@@ -188,14 +258,13 @@ def cmd_run(a) -> int:
         return 1
 
     rl = RunLog(work / "runlog.db")
-    run_id = rl.start_run(plan.schema_fingerprint, salt.recipient, salt.generation,
-                          master_salt_version=salt.version)
+    run_id = _resume_or_start_run(rl, work, plan, salt)
     print(f"run_id={run_id}")
     name_dict = _source_name_dict(a.dsn, a.schema)
 
     dump_dir = run_pass1(plan, a.dsn, salt, corpora, work, rl, run_id,
                          greenmask_bin=a.greenmask, plan_path=Path(a.plan),
-                         llm=_direct_llm(client))
+                         llm=_direct_llm(client, plan))
     print(f"проход 1 завершён: {dump_dir}")
 
     # Третий эшелон NER видит ЖИВОЙ текст, поэтому допускается только модель в
@@ -244,13 +313,25 @@ def _components(a, client) -> dict[str, list[str]]:
     return data
 
 
-def _direct_llm(client):
-    """Роль 3: карта 1:1 для не-ПДн значений. None, если поставщик не настроен."""
+def _direct_llm(client, plan):
+    """Роль 3: карта 1:1 для не-ПДн значений. None, если поставщик не настроен.
+
+    Колонка с llm_mode != "direct" в аппрувнутом плане модель не обслуживает
+    даже при настроенном поставщике: исполнение не должно молча расходиться с
+    планом, прошедшим гейт (ревью 2, §6.11 п.3). Пустая карта здесь означает
+    «модель не участвовала» - значения достраивает corpus-fallback."""
     from sanitizer import llm as llm_mod
 
     if client is None:
         return None
-    return lambda qualified, values: llm_mod.direct_map(client, values)
+
+    def call(qualified, values):
+        pc = plan.columns.get(qualified)
+        if pc is None or pc.llm_mode != "direct":
+            return {}
+        return llm_mod.direct_map(client, values)
+
+    return call
 
 
 def _ner_llm(client):
@@ -326,11 +407,24 @@ def cmd_verify(a) -> int:
     plan = Plan.load(Path(a.plan))
     work = Path(a.work)
     rl = RunLog(work / "runlog.db")
-    run_id = (work / "run_id").read_text(encoding="utf-8").strip()
-    rl.meta = {"run_id": run_id, "plan_version": plan.schema_fingerprint,
-               "master_salt_version": _salt().version, "salt_generation": _salt().generation,
-               "recipient_id": _salt().recipient, "corpus_version": "fixtures-1",
-               "cache_version": "none", "tool_version": "0.1.0"}
+    run_id = _read_run_file(work, "run_id")
+    salt = _salt()
+    meta = {"run_id": run_id, "plan_version": plan.schema_fingerprint,
+            "master_salt_version": salt.version, "salt_generation": salt.generation,
+            "recipient_id": salt.recipient, "corpus_version": "fixtures-1",
+            "cache_version": "none", "tool_version": "0.1.0"}
+    # Verify обязан относиться к ЭТОМУ прогону: журнал согласен опубликовать
+    # что угодно, если verify=done записан под тем же run_id - даже от проверки
+    # чужим планом, другой солью или для другого получателя (ревью 2, Н5).
+    recorded = rl.run_meta(run_id)
+    if recorded is not None and recorded != {k: meta[k] for k in recorded}:
+        print(f"ОТКАЗ (fail-closed): verify не относится к прогону {run_id}:")
+        print(f"  журнал: {recorded}")
+        print(f"  verify:  {dict((k, meta[k]) for k in recorded)}")
+        print("Дальше: verify тем же планом и солью, что run; либо честный "
+              "перезапуск run + verify.")
+        return 1
+    rl.meta = meta
     rl.mark("verify", "*", "running")
     corpora = build_corpora(load_components(Path(a.components)))
     report = verify(a.src_dsn, a.dst_dsn, plan, Path(a.canaries),
@@ -363,16 +457,17 @@ def cmd_publish(a) -> int:
     import shutil
 
     work = Path(a.work)
-    run_id = (work / "run_id").read_text(encoding="utf-8").strip()
+    run_id = _read_run_file(work, "run_id")
     rl = RunLog(work / "runlog.db")
     if not rl.publishable(run_id):
         print(f"ПУБЛИКАЦИЯ ЗАПРЕЩЕНА для run_id={run_id}: журнал прогона не подтверждает,")
-        print("что все стадии завершены и верификация пройдена. Записи журнала:")
+        print("что прогон полон (pass1, pass2, verify), все стадии завершены и их")
+        print("метаданные согласованы. Записи журнала:")
         for stage, tbl, status, _ in rl.entries(run_id):
             print(f"  {stage:7} {tbl:22} {status}")
         print("Дальше: устраните причину, повторите run и verify.")
         return 1
-    dump = _resolve_dump(Path((work / "dump_path").read_text(encoding="utf-8").strip()))
+    dump = _resolve_dump(Path(_read_run_file(work, "dump_path")))
     dst = Path(a.to) / run_id
     if dst.exists():
         print(f"ОТКАЗ: {dst} уже существует - публикация не перезаписывает опубликованное.")

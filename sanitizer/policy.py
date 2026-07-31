@@ -260,9 +260,16 @@ def validate_plan(plan: Plan, snap: Snapshot) -> list[str]:
     errors: list[str] = []
     by_name = {c.qualified: c for c in snap.columns}
     pii_str = {str(t) for t in PII_TYPES}
+    # Покрытие проверяется БЕЗУСЛОВНО, а не только в ветке fingerprint-mismatch:
+    # отпечаток ловит дрейф схемы, покрытие - ручную редактуру плана (удалённая
+    # из плана колонка уехала бы в копию сырой при сохранённом отпечатке).
+    # Это разные проверки, одна не заменяет другую (ревью 2, остаток находки 2).
+    missing = sorted(set(by_name) - set(plan.columns))
+    if missing:
+        errors.append(f"columns not in plan: {missing[:5]} - "
+                      f"план редактировался вручную или схема выросла")
     if plan.schema_fingerprint != schema_fingerprint(snap):
-        missing = set(by_name) - set(plan.columns)
-        errors.append(f"schema drift: fingerprint mismatch; columns not in plan: {sorted(missing)[:5]}")
+        errors.append(f"schema drift: fingerprint mismatch; columns not in plan: {missing[:5]}")
     for name, pc in plan.columns.items():
         if pc.strategy not in _STRATEGIES:
             errors.append(f"{name}: неизвестная стратегия {pc.strategy!r}; "

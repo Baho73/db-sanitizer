@@ -51,7 +51,8 @@ class RowTransformer:
 
     # START_CONTRACT: transform_row
     #   PURPOSE: Замены по стратегиям плана; ФИО-компоненты согласованы в
-    #            пределах строки (род, единый ключ идентичности).
+    #            пределах строки (род, единый ключ идентичности); пара
+    #            серия+номер паспорта заменяется единым 10-значным ключом.
     #   INPUTS: { row: dict col->{"d": str|None, "n": bool}, pk: str - значение PK }
     #   OUTPUTS: { dict той же формы }
     #   SIDE_EFFECTS: none
@@ -68,8 +69,21 @@ class RowTransformer:
             for col, value in ((last_c, f), (first_c, n), (mid_c, p)):
                 if col and not (row.get(col) or {}).get("n"):
                     _set(out, col, value.capitalize())
+        passport = self._passport_pair(row)
+        if passport:
+            series_c, number_c = passport
+            # Один паспорт - один идентификатор - одна замена: 10 цифр
+            # серия‖номер через ОДНУ gen_digits_like (та же FPE-10, что у
+            # текстового слоя и doc_number), результат разбивается 4+6.
+            # Раздельная замена давала одному документу два разных образа
+            # (ревью 2, Н3 - класс исходного блокера по СНИЛС).
+            key10 = normalize_digits(_d(row, series_c)) + normalize_digits(_d(row, number_c))
+            fake10 = gen_digits_like(self.salt, key10)
+            _set(out, series_c, fake10[:4])
+            _set(out, number_c, fake10[4:])
         for col, pc in self.cols.items():
-            if col not in row or row[col].get("n") or (fio and col in fio):
+            if col not in row or row[col].get("n") or (fio and col in fio) \
+                    or (passport and col in passport):
                 continue
             val = row[col]["d"]
             match pc.strategy:
@@ -80,9 +94,19 @@ class RowTransformer:
                 case "fake":
                     _set(out, col, self._fake(pc.sem_type, val))
                 case "direct":
-                    _set(out, col, self.direct[col][val])  # KeyError = data drift, fail-closed
+                    try:
+                        _set(out, col, self.direct[col][val])  # промах = data drift, fail-closed
+                    except KeyError:
+                        # Значение/PK в сообщение не входят: исключение пишется в
+                        # журнал, а колонка может содержать ПДн (ревью 2).
+                        raise KeyError(f"{self.table}.{col}: значение вне direct-карты "
+                                       f"(data drift), прогон остановлен") from None
                 case "shuffle":
-                    _set(out, col, self.shuffle[col][pk])
+                    try:
+                        _set(out, col, self.shuffle[col][pk])
+                    except KeyError:
+                        raise KeyError(f"{self.table}.{col}: строка вне shuffle-карты "
+                                       f"(data drift), прогон остановлен") from None
                 case "generalize":
                     _set(out, col, self._generalize(pc.sem_type, val))
                 case "null":
@@ -95,6 +119,28 @@ class RowTransformer:
                     raise ValueError(f"{self.table}.{col}: неизвестная стратегия "
                                      f"{pc.strategy!r} - прогон остановлен")
         return out
+
+    def _passport_pair(self, row) -> tuple[str, str] | None:
+        """Пара «серия + номер» одной таблицы по ПЛАНУ (sem_type passport со
+        стратегией generate), а не по угадыванию имён колонок. Серия отличается
+        от номера разрядностью значения (4 и 6 цифр). Пара возвращается, только
+        когда обе колонки не-NULL и разрядности однозначны; во всех прочих
+        случаях (одна колонка, NULL в одной из них, нестандартная разрядность)
+        действует прежнее поколоночное поведение."""
+        cols = [c for c in row if c in self.cols
+                and self.cols[c].sem_type == "passport"
+                and self.cols[c].strategy == "generate"]
+        if len(cols) != 2:
+            return None
+        a, b = cols
+        if (row.get(a) or {}).get("n") or (row.get(b) or {}).get("n"):
+            return None
+        da, db = normalize_digits(_d(row, a)), normalize_digits(_d(row, b))
+        if len(da) == 4 and len(db) == 6:
+            return a, b
+        if len(db) == 4 and len(da) == 6:
+            return b, a
+        return None
 
     def _fio_columns(self, row) -> tuple[str, str, str] | None:
         by_type = {self.cols[c].sem_type: c for c in row if c in self.cols
