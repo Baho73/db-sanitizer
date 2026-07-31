@@ -258,7 +258,8 @@ def toc_tables(dump_dir: Path, pg_restore: str = "pg_restore") -> dict[str, str]
 # END_CONTRACT: process_dump
 def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]],
                  ts: TextSanitizer, runlog=None, pg_restore: str = "pg_restore",
-                 max_len: dict[str, int | None] | None = None) -> dict:
+                 max_len: dict[str, int | None] | None = None,
+                 resume: bool = True) -> dict:
     free_cols: dict[str, list[str]] = {}
     length_policy: dict[str, str] = {}
     for qualified, pc in plan.columns.items():
@@ -270,8 +271,15 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
     limits = max_len or {}
     notes_rows: list[tuple] = []
     summary: dict = {}
+    # Возобновляемость (§5.7) была объявлена и не реализована: журнал писался, но
+    # не читался, и повторный вызов обрабатывал таблицу ВТОРОЙ раз - фейковый
+    # телефон снова попадал под шаблон и заменялся на другой фейк.
+    already_done = _completed_tables(runlog) if resume else set()
     for dumpid, table in toc_tables(dump_dir, pg_restore).items():
         if table not in free_cols:
+            continue
+        if table in already_done:
+            summary[table] = {"rows": 0, "degraded": 0, "skipped": "already done"}
             continue
         if runlog:
             runlog.mark("pass2", table, "running")
@@ -284,15 +292,22 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
         # первую попавшуюся колонку значит опубликовать её значение.
         pk_idx = order.index(plan.pk(table))
         path = dump_dir / f"{dumpid}.dat.gz"
-        rows_out, degraded = [], 0
-        with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
+        tmp = path.with_name(path.name + ".tmp")
+        rows, degraded = 0, 0
+        # Поток вместо списка строк в памяти: §5.5 говорит про 15 млн текстов,
+        # а чтение файла целиком означало бы OOM ровно на заявленном масштабе.
+        # Запись во временный файл с последующей атомарной заменой: падение
+        # посреди таблицы больше не оставляет полуобработанный дамп.
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as fh, \
+                gzip.open(tmp, "wt", encoding="utf-8", newline="") as out_fh:
             for line in fh:
+                rows += 1
                 if line.rstrip("\n") == "\\.":
-                    rows_out.append(line)
+                    out_fh.write(line)
                     continue
                 fields = line.rstrip("\n").split("\t")
                 if len(fields) < len(order):   # хвост файла / служебные строки
-                    rows_out.append(line)
+                    out_fh.write(line)
                     continue
                 pk = fields[pk_idx]
                 for i, qualified in idxs.items():
@@ -319,15 +334,29 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
                     for code in notes:
                         degraded += 1
                         notes_rows.append((table, pk, qualified.rsplit(".", 1)[1], code))
-                rows_out.append("\t".join(fields) + "\n")
-        with gzip.open(path, "wt", encoding="utf-8", newline="") as fh:
-            fh.writelines(rows_out)
-        summary[table] = {"rows": len(rows_out), "degraded": degraded}
+                out_fh.write("\t".join(fields) + "\n")
+        tmp.replace(path)
+        summary[table] = {"rows": rows, "degraded": degraded}
         if runlog:
             runlog.mark("pass2", table, "done")
 
     _write_sanitization_sql(dump_dir, notes_rows, summary)
     return summary
+
+
+def _completed_tables(runlog) -> set[str]:
+    """Таблицы, уже обработанные в этом прогоне. Проход 2 неидемпотентен: телефон,
+    заменённый однажды, при повторе заменяется снова и уезжает в третье значение."""
+    if runlog is None:
+        return set()
+    run_id = (runlog.meta or {}).get("run_id")
+    if not run_id:
+        return set()
+    last: dict[str, str] = {}
+    for stage, tbl, status, _ in runlog.entries(run_id):
+        if stage == "pass2":
+            last[tbl] = status
+    return {t for t, status in last.items() if status == "done"}
 
 
 _UNESCAPE = {"t": "\t", "n": "\n", "r": "\r", "\\": "\\"}

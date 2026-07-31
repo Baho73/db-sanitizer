@@ -7,6 +7,7 @@
 # END_MODULE_CONTRACT
 #
 # START_MODULE_MAP
+#   ident - квотированный идентификатор SQL (схема.таблица, колонка)
 #   ColumnInfo - колонка снимка
 #   ForeignKey - связь
 #   Snapshot - сериализуемый снимок схемы
@@ -20,6 +21,17 @@ import re
 from dataclasses import asdict, dataclass, field
 
 
+
+
+def ident(name: str):
+    """«схема.таблица» или имя колонки -> квотированный идентификатор.
+
+    Интерполяция имён в f-строку работает ровно до первой колонки с именем
+    `order`, `user`, CamelCase или пробелом: такие схемы роняли прогон, а на
+    имени, совпавшем со служебным словом, могли и молча изменить смысл запроса."""
+    from psycopg import sql
+
+    return sql.SQL(".").join(sql.Identifier(p) for p in name.split("."))
 
 
 @dataclass
@@ -60,6 +72,16 @@ class Snapshot:
         return json.dumps({"columns": [asdict(c) for c in self.columns],
                            "fks": [asdict(f) for f in self.fks],
                            "row_counts": self.row_counts}, ensure_ascii=False, indent=1, default=str)
+
+    @staticmethod
+    def from_json(raw: str) -> "Snapshot":
+        """Обратная сериализация: продолжение прогона после гейта идёт в ДРУГОМ
+        процессе, где модульного кэша снимка нет."""
+        d = json.loads(raw)
+        return Snapshot([ColumnInfo(**c) for c in d["columns"]],
+                        [ForeignKey(f["src_table"], tuple(f["src_cols"]),
+                                    f["dst_table"], tuple(f["dst_cols"])) for f in d["fks"]],
+                        d["row_counts"])
 
     def col(self, qualified: str) -> ColumnInfo:
         return next(c for c in self.columns if c.qualified == qualified)
@@ -107,19 +129,25 @@ WHERE tc.table_schema = %s AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')""
 
 # pg_constraint вместо information_schema: constraint_column_usage теряет порядок
 # колонок и даёт декартово произведение на композитных FK.
+# Схема сравнивается через pg_namespace.nspname, а не через regnamespace::text:
+# последний квотирует имя («"My Schema"»), сравнение с сырым именем молча не
+# совпадало бы, и FK-граф оказался бы неполным - то есть классы эквивалентности
+# распались бы, а замены разъехались.
 _FK_SQL = """
-SELECT src.relnamespace::regnamespace::text || '.' || src.relname,
+SELECT sn.nspname || '.' || src.relname,
        (SELECT array_agg(a.attname ORDER BY x.ord)
         FROM unnest(c.conkey) WITH ORDINALITY x(attnum, ord)
         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum),
-       dst.relnamespace::regnamespace::text || '.' || dst.relname,
+       dn.nspname || '.' || dst.relname,
        (SELECT array_agg(a.attname ORDER BY x.ord)
         FROM unnest(c.confkey) WITH ORDINALITY x(attnum, ord)
         JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = x.attnum)
 FROM pg_constraint c
 JOIN pg_class src ON src.oid = c.conrelid
 JOIN pg_class dst ON dst.oid = c.confrelid
-WHERE c.contype = 'f' AND src.relnamespace::regnamespace::text = %s"""
+JOIN pg_namespace sn ON sn.oid = src.relnamespace
+JOIN pg_namespace dn ON dn.oid = dst.relnamespace
+WHERE c.contype = 'f' AND sn.nspname = %s"""
 
 
 # START_CONTRACT: profile
@@ -152,10 +180,13 @@ def profile(dsn: str, schema: str = "hr", sample_n: int = 50) -> Snapshot:
         row_counts: dict[str, int] = {}
         stats: dict[tuple[str, str], tuple[int, float]] = {}
         columns: list[ColumnInfo] = []
+        from psycopg import sql
+
         for tbl, cols in sorted(by_table.items()):
-            exprs = ", ".join(f"count(DISTINCT {n}::text), avg(({n} IS NULL)::int)::float"
-                              for _, n, *_ in cols)
-            cur.execute(f"SELECT count(*), {exprs} FROM {tbl}")
+            exprs = sql.SQL(", ").join(
+                sql.SQL("count(DISTINCT {c}::text), avg(({c} IS NULL)::int)::float")
+                .format(c=ident(n)) for _, n, *_ in cols)
+            cur.execute(sql.SQL("SELECT count(*), {} FROM {}").format(exprs, ident(tbl)))
             row = cur.fetchone()
             row_counts[tbl] = row[0]
             for i, (_, name, *_) in enumerate(cols):
@@ -163,15 +194,20 @@ def profile(dsn: str, schema: str = "hr", sample_n: int = 50) -> Snapshot:
 
         for tbl, name, dtype, max_len, nullable in raw_cols:
             card, null_frac = stats[(tbl, name)]
-            cur.execute(f"SELECT DISTINCT {name}::text FROM {tbl} "
-                        f"WHERE {name} IS NOT NULL ORDER BY 1 LIMIT %s", (sample_n,))
+            cur.execute(sql.SQL("SELECT DISTINCT {c}::text FROM {t} WHERE {c} IS NOT NULL "
+                                "ORDER BY 1 LIMIT %s").format(c=ident(name), t=ident(tbl)),
+                        (sample_n,))
             samples = [r[0] for r in cur.fetchall()]
             info = ColumnInfo(tbl, name, dtype, max_len, nullable,
                               (tbl, name) in uniq, (tbl, name) in pk,
                               card or 0, null_frac or 0.0, samples)
             if dtype == "jsonb":
-                cur.execute(f"SELECT DISTINCT jsonb_object_keys({name}) FROM {tbl} "
-                            f"WHERE {name} IS NOT NULL LIMIT 50")
+                # ORDER BY обязателен: без него набор ключей плавал между
+                # прогонами, отпечаток схемы становился недетерминированным, а
+                # ключи вне выборки молча обнулялись на исполнении
+                cur.execute(sql.SQL("SELECT DISTINCT jsonb_object_keys({c}) FROM {t} "
+                                    "WHERE {c} IS NOT NULL ORDER BY 1 LIMIT 500")
+                            .format(c=ident(name), t=ident(tbl)))
                 info.json_keys = sorted(r[0] for r in cur.fetchall())
             if dtype in ("character varying", "text") and _looks_addressish(name, samples):
                 info.addr_parse_ratio = addr_parse_ratio(samples)

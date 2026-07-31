@@ -11,6 +11,7 @@
 #   DEF_COMPONENTS - путь к компонентам корпусов по умолчанию
 #   cmd_demo_seed - посев демо-базы
 #   cmd_plan - фаза планирования с гейтом
+#   cmd_approve - продолжение после гейта другой командой (персистентный чекпойнт)
 #   cmd_run - исполнение: проход 1 и проход 2
 #   cmd_restore - разворачивание дампа в staging вместе со схемой sanitization
 #   cmd_verify - верификация и блокировка публикации
@@ -64,6 +65,7 @@ def cmd_plan(a) -> int:
     from sanitizer.plan_graph import build_graph, run_planning
 
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
+    graph = build_graph(Path(a.checkpoint))
     state = {"dsn": a.dsn, "schema": a.schema, "llm_cache": a.llm_cache,
              "llm_available": bool(cfg.get("llm_available")),
              "json_map": cfg.get("json_map", {}),
@@ -73,7 +75,7 @@ def cmd_plan(a) -> int:
              "params": cfg.get("params", {}),
              "plan_path": a.plan, "auto_approve": a.auto_approve}
     try:
-        out = run_planning(build_graph(), state)
+        out = run_planning(graph, state, thread_id=a.thread)
     except ValueError as e:  # запрещённый override - решение человека вне гейта
         print(f"КОНФИГ ОТКЛОНЁН (fail-closed): {e}")
         return 1
@@ -84,8 +86,10 @@ def cmd_plan(a) -> int:
         print(f"  Дифф: {payload['diff'] or 'первый прогон'}")
         for e in payload["validation_errors"]:
             print(f"  БЛОКЕР: {e}")
-        print("Дальше: проверьте черновик и запустите с --auto-approve "
-              "либо задайте решения в plan-config.json (overrides).")
+        print("Дальше: прочитайте черновик и подтвердите решение человека:")
+        print(f"  sanitizer approve --thread {a.thread} "
+              f"[--confirm колонка ...] [--reject]")
+        print("  (разметку колонок задавайте в plan-config.json, overrides)")
         return 2
     if out.get("errors"):
         print("ПЛАН ОТКЛОНЁН ВАЛИДАЦИЕЙ (fail-closed):")
@@ -93,6 +97,40 @@ def cmd_plan(a) -> int:
             print(f"  {e}")
         return 1
     print(f"План записан: {a.plan}")
+    return 0
+
+
+# START_CONTRACT: cmd_approve
+#   PURPOSE: Продолжение остановленного на гейте планирования ДРУГОЙ командой,
+#            возможно через сутки и из другого процесса. Ради этого свойства и
+#            выбирался LangGraph; с чекпойнтером в памяти оно не работало.
+#   INPUTS: { checkpoint: файл состояния, thread: идентификатор прогона,
+#             confirm: колонки, подтверждаемые человеком, reject: отклонить план }
+#   OUTPUTS: { 0 - план записан; 1 - отклонён или заблокирован валидацией }
+#   SIDE_EFFECTS: запись плана, обновление чекпойнта
+# END_CONTRACT: cmd_approve
+def cmd_approve(a) -> int:
+    from langgraph.types import Command
+
+    from sanitizer.plan_graph import build_graph
+
+    graph = build_graph(Path(a.checkpoint))
+    cfg = {"configurable": {"thread_id": a.thread}}
+    if not graph.get_state(cfg).next:
+        print(f"Нечего подтверждать: прогон {a.thread!r} не остановлен на гейте.")
+        print("Дальше: запустите sanitizer plan, он остановится и назовёт черновик.")
+        return 1
+    answer = {"approve": not a.reject, "confirm": list(a.confirm or [])}
+    out = graph.invoke(Command(resume=answer), cfg)
+    if a.reject:
+        print("План ОТКЛОНЁН человеком; файл плана не записан.")
+        return 1
+    if out.get("errors"):
+        print("ПЛАН ОТКЛОНЁН ВАЛИДАЦИЕЙ (fail-closed):")
+        for e in out["errors"]:
+            print(f"  {e}")
+        return 1
+    print(f"Подтверждено человеком. План записан: {out.get('plan_path', 'см. --plan')}")
     return 0
 
 
@@ -180,8 +218,12 @@ def _source_name_dict(dsn: str, schema: str = "hr") -> frozenset[str]:
             "FROM information_schema.columns WHERE table_schema = %s "
             "AND column_name IN ('last_name','first_name','middle_name','patronymic')",
             (schema,))
+        from psycopg import sql
+
+        from sanitizer.profiler import ident
         for table, col in cur.fetchall():
-            cur.execute(f"SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL")
+            cur.execute(sql.SQL("SELECT DISTINCT {c} FROM {t} WHERE {c} IS NOT NULL")
+                        .format(c=ident(col), t=ident(table)))
             words |= {r[0].lower().replace("ё", "е") for r in cur.fetchall()}
     return frozenset(words)
 
@@ -292,8 +334,17 @@ def main() -> int:
     p.add_argument("--llm-cache", default="tests/fixtures/llm_votes_demo.json")
     p.add_argument("--plan", default="out/sanitization-plan.yaml")
     p.add_argument("--schema", default="hr")
+    p.add_argument("--checkpoint", default="out/plan-state.db")
+    p.add_argument("--thread", default="plan")
     p.add_argument("--auto-approve", action="store_true")
     p.set_defaults(fn=cmd_plan)
+
+    p = sub.add_parser("approve")
+    p.add_argument("--checkpoint", default="out/plan-state.db")
+    p.add_argument("--thread", default="plan")
+    p.add_argument("--confirm", nargs="*", default=[])
+    p.add_argument("--reject", action="store_true")
+    p.set_defaults(fn=cmd_approve)
 
     p = sub.add_parser("run")
     p.add_argument("--dsn", default=os.environ.get("DEMO_DSN", "postgresql://demo:demo@127.0.0.1:55432/demo"))

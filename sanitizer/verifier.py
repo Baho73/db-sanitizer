@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from sanitizer.policy import Plan
+from sanitizer.profiler import ident
 
 
 
@@ -85,6 +86,7 @@ def verify(src_dsn: str, dst_dsn: str, plan: Plan, canary_manifest: Path,
            entropy_drop_max: float = 0.10, schema: str | None = None,
            corpus_sizes: dict[str, int] | None = None) -> VerifyReport:
     import psycopg
+    from psycopg import sql
 
     manifest = json.loads(canary_manifest.read_text(encoding="utf-8"))
     canaries: dict[str, str] = manifest["values"]
@@ -108,8 +110,9 @@ def verify(src_dsn: str, dst_dsn: str, plan: Plan, canary_manifest: Path,
         # 1. Объём: count(*) совпадает
         bad = []
         for t in tables:
-            s.execute(f"SELECT count(*) FROM {t}")
-            d.execute(f"SELECT count(*) FROM {t}")
+            q = sql.SQL("SELECT count(*) FROM {}").format(ident(t))
+            s.execute(q)
+            d.execute(q)
             if s.fetchone()[0] != d.fetchone()[0]:
                 bad.append(t)
         r.add("Объём: count(*) по таблицам", not bad, f"расхождения: {bad}" if bad else f"{len(tables)} таблиц")
@@ -195,6 +198,8 @@ _DIGIT_RUN_RE = re.compile(r"\d[\d\s-]{8,17}\d")
 
 def _corpus_ceiling(pc, s, table: str, col: str,
                     corpus_sizes: dict[str, int] | None) -> float | None:
+    from psycopg import sql
+
     """Достижимая энтропия колонки со стратегией fake: сколько различных значений
     в принципе может дать корпус при отображении n исходников хэшем в m ячеек."""
     if pc.strategy != "fake" or not corpus_sizes:
@@ -206,7 +211,7 @@ def _corpus_ceiling(pc, s, table: str, col: str,
     if not sizes:
         return None
     m = min(sizes)
-    s.execute(f"SELECT count(DISTINCT {col}) FROM {table}")
+    s.execute(sql.SQL("SELECT count(DISTINCT {c}) FROM {t}").format(c=ident(col), t=ident(table)))
     n = s.fetchone()[0] or 0
     if not n or not m:
         return None
@@ -223,6 +228,8 @@ def _corpus_ceiling(pc, s, table: str, col: str,
 #   SIDE_EFFECTS: чтение обеих БД
 # END_CONTRACT: _identifier_leak
 def _identifier_leak(s, d, plan: Plan, text_cols: dict[str, list[str]]) -> list[str]:
+    from psycopg import sql
+
     from sanitizer.mapper import normalize_digits, valid_inn, valid_ogrn, valid_snils
 
     wanted: set[str] = set()
@@ -230,7 +237,8 @@ def _identifier_leak(s, d, plan: Plan, text_cols: dict[str, list[str]]) -> list[
         if pc.sem_type not in ("inn", "snils", "ogrn"):
             continue
         table, col = qualified.rsplit(".", 1)
-        s.execute(f"SELECT DISTINCT {col}::text FROM {table} WHERE {col} IS NOT NULL")
+        s.execute(sql.SQL("SELECT DISTINCT {c}::text FROM {t} WHERE {c} IS NOT NULL")
+                  .format(c=ident(col), t=ident(table)))
         wanted |= {normalize_digits(r[0]) for r in s.fetchall()}
     wanted = {w for w in wanted if valid_inn(w) or valid_snils(w) or valid_ogrn(w)}
     if not wanted:
@@ -239,7 +247,8 @@ def _identifier_leak(s, d, plan: Plan, text_cols: dict[str, list[str]]) -> list[
     found: list[str] = []
     for table, cols in sorted(text_cols.items()):
         for col in cols:
-            d.execute(f"SELECT {col}::text FROM {table} WHERE {col} IS NOT NULL")
+            d.execute(sql.SQL("SELECT {c}::text FROM {t} WHERE {c} IS NOT NULL")
+                      .format(c=ident(col), t=ident(table)))
             hits = 0
             for (value,) in d.fetchall():
                 for run in _DIGIT_RUN_RE.findall(value):
@@ -278,6 +287,16 @@ def _degradation_check(r: VerifyReport, d, plan: Plan):
 #   OUTPUTS: { none - отчёт пополняется }
 #   SIDE_EFFECTS: чтение копии
 # END_CONTRACT: _consistency_checks
+def _probe_sql(probe: dict, order: bool = False):
+    """Проба из манифеста -> запрос с квотированными идентификаторами.
+    Манифест - файл рядом с дампом, его содержимое в SQL не подставляется сырым."""
+    from psycopg import sql
+
+    q = sql.SQL("SELECT {c} FROM {t} WHERE {k} = %s").format(
+        c=ident(probe["column"]), t=ident(probe["table"]), k=ident(probe["key_column"]))
+    return q + sql.SQL(" ORDER BY 1 DESC LIMIT 1") if order else q
+
+
 def _consistency_checks(r: VerifyReport, cur, manifest: dict):
     probes = manifest.get("probes")
     if not probes:
@@ -287,17 +306,14 @@ def _consistency_checks(r: VerifyReport, cur, manifest: dict):
               "проба не описана в манифесте канареек", skipped=True)
         return
 
-    ident = probes["identity"]           # где лежит эталонное значение личности
-    cur.execute(f"SELECT {ident['column']} FROM {ident['table']} "
-                f"WHERE {ident['key_column']} = %s", (ident["key"],))
+    identity = probes["identity"]        # где лежит эталонное значение личности
+    cur.execute(_probe_sql(identity), (identity["key"],))
     row = cur.fetchone()
     fam = row[0] if row else None
     base = (fam or "").rstrip("а")       # женская форма в склейке «Канарейкина В.П.»
     seen = []
     for probe in probes.get("occurrences", []):
-        cur.execute(f"SELECT {probe['column']} FROM {probe['table']} "
-                    f"WHERE {probe['key_column']} = %s ORDER BY 1 DESC LIMIT 1",
-                    (probe["key"],))
+        cur.execute(_probe_sql(probe, order=True), (probe["key"],))
         got = cur.fetchone()
         text = got[0] if got else ""
         needle = base if probe.get("initials") else fam
@@ -314,8 +330,7 @@ def _consistency_checks(r: VerifyReport, cur, manifest: dict):
         r.add("Текст не испорчен: не-ПДн фрагменты сохранены дословно", False,
               "проба не описана в манифесте канареек", skipped=True)
     for probe in probes.get("preserved", []):
-        cur.execute(f"SELECT {probe['column']} FROM {probe['table']} "
-                    f"WHERE {probe['key_column']} = %s", (probe["key"],))
+        cur.execute(_probe_sql(probe), (probe["key"],))
         got = cur.fetchone()
         if not got or probe["substring"] not in (got[0] or ""):
             broken.append(f"{probe['table']}.{probe['column']}")
@@ -329,8 +344,7 @@ def _consistency_checks(r: VerifyReport, cur, manifest: dict):
         return
     values = []
     for side in link["sides"]:
-        cur.execute(f"SELECT {side['column']} FROM {side['table']} "
-                    f"WHERE {side['key_column']} = %s", (side["key"],))
+        cur.execute(_probe_sql(side), (side["key"],))
         got = cur.fetchone()
         values.append(got[0] if got else None)
     r.add("Мягкая связь консистентна", len(set(values)) == 1 and values[0] is not None,
@@ -372,30 +386,43 @@ def _primary_keys(cur, schema: str) -> dict[str, list[str]]:
     return out
 
 
-def _pk_expr(pk_of: dict[str, list[str]], table: str) -> str:
+def _pk_expr(pk_of: dict[str, list[str]], table: str):
+    """Ключ строки для построчной сверки. Разделитель - управляющий символ, а не
+    «/»: склейка через печатный разделитель давала коллизии («a/b»+«c» и «a»+«b/c»)
+    и сверка молча теряла нарушения."""
+    from psycopg import sql
+
     cols = pk_of.get(table) or []
     if not cols:
         raise ValueError(f"{table}: нет первичного ключа - построчная сверка невозможна")
-    return " || '/' || ".join(f"{c}::text" for c in cols)
+    return sql.SQL("concat_ws(chr(1), {})").format(
+        sql.SQL(", ").join(sql.SQL("{}::text").format(ident(c)) for c in cols))
 
 
 def _found_anywhere(cur, text_cols: dict[str, list[str]], needle: str) -> bool:
     for table, cols in text_cols.items():
-        conds = " OR ".join(f"{c}::text ILIKE %s" for c in cols)
-        cur.execute(f"SELECT 1 FROM {table} WHERE {conds} LIMIT 1",
+        from psycopg import sql
+
+        conds = sql.SQL(" OR ").join(sql.SQL("{}::text ILIKE %s").format(ident(c)) for c in cols)
+        cur.execute(sql.SQL("SELECT 1 FROM {} WHERE {} LIMIT 1").format(ident(table), conds),
                     [f"%{needle}%"] * len(cols))
         if cur.fetchone():
             return True
     return False
 
 
-def _col_by_pk(cur, table: str, col: str, pk_expr: str) -> dict:
-    cur.execute(f"SELECT {pk_expr}, {col}::text FROM {table}")
+def _col_by_pk(cur, table: str, col: str, pk_expr) -> dict:
+    from psycopg import sql
+
+    cur.execute(sql.SQL("SELECT {k}, {c}::text FROM {t}")
+                .format(k=pk_expr, c=ident(col), t=ident(table)))
     return dict(cur.fetchall())
 
 
 def _col_entropy(cur, table: str, col: str) -> float:
-    cur.execute(f"SELECT count(*) FROM {table} GROUP BY {col}")
+    from psycopg import sql
+
+    cur.execute(sql.SQL("SELECT count(*) FROM {t} GROUP BY {c}").format(t=ident(table), c=ident(col)))
     return entropy([r[0] for r in cur.fetchall()])
 
 
@@ -407,6 +434,7 @@ def column_checksums(dsn: str, plan: Plan, schema: str | None = None) -> dict[st
     """Поколоночные md5 для сравнения двух прогонов (§7 воспроизводимость).
     Свободнотекстовые колонки включаются только при перенесённом кэше."""
     import psycopg
+    from psycopg import sql
 
     schema = schema or sorted({q.split(".", 1)[0] for q in plan.columns})[0]
     out: dict[str, str] = {}
@@ -416,8 +444,9 @@ def column_checksums(dsn: str, plan: Plan, schema: str | None = None) -> dict[st
             if pc.strategy in ("keep", "unresolved"):
                 continue
             table, col = qualified.rsplit(".", 1)
-            order = ", ".join(pk_of.get(table) or [col])
-            cur.execute(f"SELECT md5(string_agg({col}::text, '' ORDER BY {order})) FROM {table}")
+            order = sql.SQL(", ").join(ident(c) for c in (pk_of.get(table) or [col]))
+            cur.execute(sql.SQL("SELECT md5(string_agg({c}::text, '' ORDER BY {o})) FROM {t}")
+                        .format(c=ident(col), o=order, t=ident(table)))
             out[qualified] = cur.fetchone()[0] or ""
     return out
 

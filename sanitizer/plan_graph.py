@@ -50,7 +50,17 @@ class PlanState(TypedDict, total=False):
     diff: dict
 
 
-_SNAP_CACHE: dict[str, Snapshot] = {}  # snapshot непереносим в JSON-состояние целиком
+_SNAP_CACHE: dict[str, Snapshot] = {}  # только оптимизация в пределах процесса
+
+
+def _snapshot(state: PlanState) -> Snapshot:
+    """Снимок из кэша процесса либо из состояния графа. Раньше кэш был
+    ЕДИНСТВЕННЫМ источником: при персистентном чекпойнтере продолжение в новом
+    процессе падало бы на KeyError, то есть гейт и не мог работать между запусками."""
+    cached = _SNAP_CACHE.get(state["dsn"])
+    if cached is not None:
+        return cached
+    return Snapshot.from_json(state["snapshot_json"])
 
 # Поля PlanColumn, которые человек вправе переопределить конфигом. `confirmed`
 # и `confirmed_by` сюда НЕ входят: подтверждение выдаётся только на гейте, иначе
@@ -87,7 +97,7 @@ def _node_profile(state: PlanState) -> dict:
 
 
 def _node_classify_and_assign(state: PlanState) -> dict:
-    snap = _SNAP_CACHE[state["dsn"]]
+    snap = _snapshot(state)
     votes = llm_classify(snap.columns, Path(state["llm_cache"]))
     classified = classify(snap.columns, votes)
     plan = assign(classified, snap,
@@ -124,7 +134,7 @@ def _node_gate(state: PlanState) -> dict:
 def _node_finalize(state: PlanState) -> dict:
     draft = Path(state["plan_path"]).with_suffix(".draft.yaml")
     plan = Plan.load(draft)
-    snap = _SNAP_CACHE[state["dsn"]]
+    snap = _snapshot(state)
     for col in state.get("confirm") or []:
         if col not in plan.columns:
             return {"errors": [f"подтверждение для неизвестной колонки {col}"], "approved": False}
@@ -142,7 +152,23 @@ def _node_finalize(state: PlanState) -> dict:
 
 
 
-def build_graph():
+def build_graph(checkpoint_path: Path | None = None):
+    """Чекпойнтер на диске, если путь задан. С MemorySaver гейт был декорацией:
+    состояние умирало вместе с процессом, продолжить прогон другой командой было
+    нельзя, и единственным рабочим путём оставался --auto-approve. Ради этого
+    свойства (§4.5 «продолжение хоть через сутки») и выбирался LangGraph."""
+    if checkpoint_path is not None:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        import sqlite3
+
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        conn = sqlite3.connect(checkpoint_path, check_same_thread=False)
+        return _compile(SqliteSaver(conn))
+    return _compile(MemorySaver())
+
+
+def _compile(checkpointer):
     g = StateGraph(PlanState)
     g.add_node("profile", _node_profile)
     g.add_node("classify_assign", _node_classify_and_assign)
@@ -153,7 +179,7 @@ def build_graph():
     g.add_edge("classify_assign", "gate")
     g.add_conditional_edges("gate", lambda s: "finalize" if s.get("approved") else END)
     g.add_edge("finalize", END)
-    return g.compile(checkpointer=MemorySaver())
+    return g.compile(checkpointer=checkpointer)
 
 
 def run_planning(graph, state: PlanState, thread_id: str = "plan") -> dict:

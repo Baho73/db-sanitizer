@@ -6,7 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends postgresql-clie
     && rm -rf /var/lib/apt/lists/*
 COPY --from=greenmask /usr/bin/greenmask /usr/local/bin/greenmask
 WORKDIR /app
-RUN pip install --no-cache-dir faker "psycopg[binary]" pyyaml langgraph pytest
+# Версии зафиксированы: плавающие зависимости делают «воспроизводимый прогон»
+# воспроизводимым только до следующего релиза любой из них.
+# Версии зафиксированы: плавающие зависимости делают «воспроизводимый прогон»
+# воспроизводимым только до следующего релиза любой из них.
+RUN pip install --no-cache-dir       faker==40.13.0 "psycopg[binary]==3.3.4" pyyaml==6.0.1       langgraph==1.2.10 langgraph-checkpoint-sqlite==3.1.1 pytest==9.0.2
 COPY pyproject.toml README.md ./
 COPY sanitizer sanitizer
 COPY tests tests

@@ -7,7 +7,7 @@ import pytest
 
 from sanitizer import cli
 
-SUBCOMMANDS = {"demo-seed", "plan", "run", "restore", "verify", "report"}
+SUBCOMMANDS = {"demo-seed", "plan", "run", "restore", "verify", "publish", "report", "approve"}
 
 
 def parse(argv):

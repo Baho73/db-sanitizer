@@ -21,6 +21,7 @@ from pathlib import Path
 import yaml
 
 from sanitizer.mapper import Mapper, Salt, _h, salt_fingerprint
+from sanitizer.profiler import ident
 from sanitizer.policy import Plan
 from sanitizer.runlog import RunLog
 
@@ -38,6 +39,7 @@ from sanitizer.runlog import RunLog
 def prepare_artifacts(plan: Plan, dsn: str, salt: Salt, corpora: dict[str, list[str]],
                       out_dir: Path, llm=None) -> list[Path]:
     import psycopg
+    from psycopg import sql
 
     out_dir.mkdir(parents=True, exist_ok=True)
     # Проход 1 исполняется в дочернем процессе Greenmask, который читает соль из
@@ -50,7 +52,8 @@ def prepare_artifacts(plan: Plan, dsn: str, salt: Salt, corpora: dict[str, list[
         for qualified, pc in plan.columns.items():
             table, col = qualified.rsplit(".", 1)
             if pc.strategy == "direct":
-                cur.execute(f"SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL")
+                cur.execute(sql.SQL("SELECT DISTINCT {c} FROM {t} WHERE {c} IS NOT NULL")
+                            .format(c=ident(col), t=ident(table)))
                 values = [r[0] for r in cur.fetchall()]
                 if llm:
                     mapping = llm(qualified, values)
@@ -125,6 +128,8 @@ def _entity_column(plan: Plan, table: str, pk: str) -> tuple[str, str]:
 #   SIDE_EFFECTS: чтение источника
 # END_CONTRACT: _group_permutations
 def _group_permutations(cur, plan: Plan, salt: Salt) -> dict:
+    from psycopg import sql
+
     members: dict[str, dict[str, str]] = {}          # группа -> таблица -> колонка-сущность
     for qualified, pc in plan.columns.items():
         if pc.strategy != "shuffle":
@@ -137,7 +142,8 @@ def _group_permutations(cur, plan: Plan, salt: Salt) -> dict:
     for group, tables in members.items():
         union: set[str] = set()
         for table, entity in tables.items():
-            cur.execute(f"SELECT DISTINCT {entity}::text FROM {table} WHERE {entity} IS NOT NULL")
+            cur.execute(sql.SQL("SELECT DISTINCT {e}::text FROM {t} WHERE {e} IS NOT NULL")
+                        .format(e=ident(entity), t=ident(table)))
             union |= {r[0] for r in cur.fetchall()}
         ids = sorted(union)
         targets = sorted(ids, key=lambda e: _h(salt, "shuffle", group, str(plan.version), e))
@@ -170,11 +176,13 @@ def _induced(perm: dict[str, str], present: set[str], e: str) -> str:
 #   SIDE_EFFECTS: чтение источника
 # END_CONTRACT: _shuffle_map
 def _shuffle_map(cur, plan: Plan, table: str, col: str, perms: dict) -> dict[str, str]:
+    from psycopg import sql
+
     pk = _single_pk(plan, table)
     entity, group = _entity_column(plan, table, pk)
     perm = perms[group]["perm"]
-    cur.execute(f"SELECT {pk}::text, {entity}::text, {col}::text FROM {table} "
-                f"ORDER BY {entity}, {pk}")
+    cur.execute(sql.SQL("SELECT {k}::text, {e}::text, {c}::text FROM {t} ORDER BY {e}, {k}")
+                .format(k=ident(pk), e=ident(entity), c=ident(col), t=ident(table)))
     by_entity: dict[str, list[tuple[str, str]]] = {}
     for row_pk, ent, value in cur.fetchall():
         by_entity.setdefault(ent, []).append((row_pk, value))

@@ -128,7 +128,7 @@ def generate_rows(scale: str = "small", seed: int = 42) -> Rows:
         tab_no = (1_000_000 + i) if rnd.random() < HOSTILE["tab_no_wide_share"] else 100_000 + i
         salary_of[i] = rnd.randint(400, 3200) * 100
         employees.append((i, tab_no, last, first, middle,
-                          fake.date_of_birth(minimum_age=20, maximum_age=60), inn, snils,
+                          fake.date_between(date(1966, 1, 1), date(2006, 1, 1)), inn, snils,
                           f"{rnd.randint(40, 45)}{rnd.randint(10, 25)}", f"{rnd.randint(100101, 999999)}",
                           phone, email, salary_of[i], rnd.randint(1, 7),
                           attrs, rnd.randint(1, len(departments)), rnd.randint(1, len(positions)),

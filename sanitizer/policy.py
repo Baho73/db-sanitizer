@@ -92,7 +92,9 @@ def schema_fingerprint(snap: Snapshot) -> str:
     # json_keys входят в отпечаток наравне с колонками: новый ключ внутри jsonb -
     # такой же дрейф схемы, как новая колонка, и без него он уезжает мимо гейта
     # (разбор 4, находка 3Б).
-    payload = "|".join(f"{c.qualified}:{c.data_type}:{','.join(c.json_keys)}"
+    # max_len входит в отпечаток: сужение varchar(60)->varchar(10) меняет
+    # исполнимость плана так же, как смена типа
+    payload = "|".join(f"{c.qualified}:{c.data_type}:{c.max_len}:{','.join(c.json_keys)}"
                        for c in sorted(snap.columns, key=lambda c: c.qualified))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
