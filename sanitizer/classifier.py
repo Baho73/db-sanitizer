@@ -126,7 +126,10 @@ def rules_detect(col: ColumnInfo) -> tuple[SemType | None, float]:
             return SemType.PATRONYMIC, 0.6
         return SemType.NAME, 0.6
     if col.addr_parse_ratio is not None:
-        return SemType.ADDRESS, 0.7
+        # Уверенность следует за долей разборов, а не назначается константой:
+        # прежние 0.7 звучали одинаково и при addr_parse=0.95, и при addr_parse=0.0,
+        # то есть голос был увереннее, чем есть основания.
+        return SemType.ADDRESS, round(0.4 + 0.5 * col.addr_parse_ratio, 2)
     avg_words = sum(len(v.split()) for v in s) / len(s) if s else 0
     if col.data_type == "text" or avg_words > 5:
         return SemType.FREE_TEXT, 0.7

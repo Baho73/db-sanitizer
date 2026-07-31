@@ -54,6 +54,30 @@ def test_class_inherits_strategy():
     assert plan.columns["hr.c.inn"].strategy == plan.columns["hr.e.inn"].strategy == "generate"
 
 
+def test_class_of_mixed_types_does_not_inherit_silently():
+    """Разбор 4, нарушение монотонности: наследование переписывало strategy,
+    не трогая sem_type. КПП получал fake от связанной колонки-города и уходил
+    в ветку «название организации» - 14 символов в varchar(9)."""
+    cols = [
+        ColumnInfo("hr.o", "kpp", "character varying", 9, False, False, False, 60, 0.0, ["770101001"]),
+        ColumnInfo("hr.o", "city", "character varying", 80, False, False, False, 60, 0.0, ["Тверь"]),
+    ]
+    snap = Snapshot(cols, [ForeignKey("hr.o", ("kpp",), "hr.o", ("city",))], {"hr.o": 60})
+    plan = assign([ClassifiedColumn("hr.o.kpp", SemType.KPP, 0.9, False, "agree"),
+                   ClassifiedColumn("hr.o.city", SemType.CITY, 0.9, False, "agree")], snap)
+    assert plan.columns["hr.o.kpp"].strategy == "unresolved"
+    assert "разные типы" in plan.columns["hr.o.kpp"].reason
+
+
+def test_thresholds_come_from_plan_params():
+    """Порог - параметр плана: назначение и валидация обязаны читать одно число."""
+    snap = make_snap()
+    plan = assign(classified(), snap, params={"fake_min_cardinality": 10})
+    assert plan.params["fake_min_cardinality"] == 10
+    # org с кардинальностью 60 больше не считается низкокардинальным
+    assert not any("frequency attack" in e for e in validate_plan(plan, snap))
+
+
 def test_validation_fail_closed():
     snap = make_snap()
     plan = assign(classified(), snap, json_map={"hr.e.attrs": {"phone": "phone"}})

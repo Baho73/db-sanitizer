@@ -118,7 +118,13 @@ _STRATEGY: dict[SemType, tuple[str, str]] = {  # sem_type -> (strategy, llm_mode
 def assign(classified: list[ClassifiedColumn], snap: Snapshot,
            sensitive_categories: set[str] = frozenset(),
            json_map: dict[str, dict[str, str]] | None = None,
-           llm_available: bool = False) -> Plan:
+           llm_available: bool = False, params: dict | None = None) -> Plan:
+    # Пороги - параметры плана (§3.1), а не константы кода: назначение и его
+    # проверка обязаны читать одни и те же числа, иначе план и валидация
+    # расходятся молча. Константы модуля остаются умолчанием.
+    p = {"direct_threshold": DIRECT_THRESHOLD, "fake_min_cardinality": FAKE_MIN_CARD,
+         "addr_parse_threshold": ADDR_PARSE_THRESHOLD, **(params or {}),
+         "llm_available": llm_available}
     cols: dict[str, PlanColumn] = {}
     for cc in classified:
         info = snap.col(cc.column)
@@ -143,15 +149,15 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
             else:
                 cols[cc.column] = PlanColumn(str(st), "jsonb", "none", "jsonb", json_fields=fields)
             continue
-        if st == SemType.ADDRESS and (info.addr_parse_ratio or 0) < ADDR_PARSE_THRESHOLD:
+        if st == SemType.ADDRESS and (info.addr_parse_ratio or 0) < p["addr_parse_threshold"]:
             strategy, mode, reason = "freetext", "none", f"addr_parse={info.addr_parse_ratio}"  # §3.2 п.3
         if cc.column in sensitive_categories:
             strategy, mode, reason = "shuffle", "none", "sensitive-category"
-        if strategy == "fake" and info.cardinality < FAKE_MIN_CARD and st not in PII_TYPES:
+        if strategy == "fake" and info.cardinality < p["fake_min_cardinality"] and st not in PII_TYPES:
             strategy, reason = "keep", f"low-card {info.cardinality}"          # §5.6
-        if strategy == "fake" and info.cardinality < FAKE_MIN_CARD and st in PII_TYPES:
+        if strategy == "fake" and info.cardinality < p["fake_min_cardinality"] and st in PII_TYPES:
             pass  # ПДн малой кардинальности: fake запрещён - валидация потребует решения
-        if strategy == "direct" and (st in PII_TYPES or info.cardinality > DIRECT_THRESHOLD):
+        if strategy == "direct" and (st in PII_TYPES or info.cardinality > p["direct_threshold"]):
             strategy, mode, reason = "fake", "corpus", "direct-forbidden"      # §3.1
         # Стратегия direct - это МАТЕРИАЛИЗОВАННАЯ карта 1:1 (инъективная по
         # построению). Кто её произвёл, говорит llm_mode: "direct" - модель,
@@ -173,17 +179,26 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
         cols[cc.column] = PlanColumn(str(st), strategy, mode, reason)
 
     classes = [sorted(c) for c in equivalence_classes(snap)]
-    # стратегия класса: наследуется от неткехнической колонки класса
+    # Стратегия класса наследуется ТОЛЬКО между колонками одного семантического
+    # типа. Прежняя версия переписывала strategy, не трогая sem_type: КПП, попав
+    # в класс с колонкой-городом, получал fake и проваливался в ветку «название
+    # организации» - 14 символов в varchar(9) и падение на restore. Замена должна
+    # соответствовать типу колонки, иначе консистентность покупается порчей.
     for cls in classes:
-        strategies = {cols[c].strategy for c in cls if c in cols and cols[c].strategy != "keep"}
+        members = [c for c in cls if c in cols]
+        types = {cols[c].sem_type for c in members if cols[c].sem_type != str(SemType.TECHNICAL)}
+        if len(types) > 1:
+            for c in members:
+                cols[c] = PlanColumn(cols[c].sem_type, "unresolved", "none",
+                                     f"класс связывает разные типы {sorted(types)}: нужно решение человека")
+            continue
+        strategies = {cols[c].strategy for c in members if cols[c].strategy != "keep"}
         if len(strategies) == 1:
             s = strategies.pop()
-            for c in cls:
-                if c in cols and cols[c].strategy == "keep" and cols[c].sem_type != str(SemType.TECHNICAL):
+            for c in members:
+                if cols[c].strategy == "keep" and cols[c].sem_type != str(SemType.TECHNICAL):
                     cols[c].strategy = s
-    return Plan(1, schema_fingerprint(snap), cols, classes, [],
-                {"direct_threshold": DIRECT_THRESHOLD, "fake_min_cardinality": FAKE_MIN_CARD,
-                 "addr_parse_threshold": ADDR_PARSE_THRESHOLD, "llm_available": llm_available})
+    return Plan(1, schema_fingerprint(snap), cols, classes, [], p)
 
 
 
