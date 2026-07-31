@@ -9,7 +9,12 @@
 
 ## 1. Формат решения и обоснование
 
-**Репозиторий** с контейнеризированной утилитой (CLI): `docker compose` поднимает демо-Postgres, staging-Postgres и контейнер инструмента; полный цикл — одна команда `make demo`. Формат выбран вместо стенда, чтобы проверяющий воспроизводил результат локально и видел код.
+**Репозиторий** с контейнеризированной утилитой (CLI): `docker compose` поднимает демо-Postgres, staging-Postgres и контейнер инструмента; полный цикл — одна команда `make demo`. Репозиторий выбран основным форматом, чтобы проверяющий воспроизводил результат локально и видел код.
+
+Чтобы результат можно было увидеть, ничего не запуская, к нему приложены оба варианта демонстрации:
+
+- **сопоставление «до/после» текстом** — `docs/demo-report.md` (вход-подключение) и `docs/demo-report-dump-input.md` (вход-дамп); открываются прямо в репозитории;
+- **развёрнутый стенд** с той же страницей сравнения — `https://sanitizer.teamplan.ru` (вход по логину и паролю, они в сопроводительном письме).
 
 Центральная идея: **санитизация — это компилятор, а не скрипт**. LLM-агенты работают на метаданных в редкой «фазе планирования» и производят ревьюируемый артефакт — `sanitization-plan.yaml`. Исполнение — детерминированный конвейер без LLM в горячем цикле, двумя проходами:
 
@@ -90,7 +95,7 @@ profiler → classifier ⇄ rules      проход 1: Greenmask + Cmd (COPY-п�
 
 ## Запуск
 
-Требования: Docker (compose v2), `make`. Всё остальное — в контейнерах.
+Требования: Docker (compose v2). Всё остальное — в контейнерах. `make` — только удобство; без него те же шаги вызываются напрямую (см. ниже).
 
 ```bash
 # полный цикл: посев демо-базы → план с гейтом → два прохода → restore → верификация
@@ -103,6 +108,21 @@ make demo-dump
 # юнит-тесты (без Postgres и LLM)
 make test
 ```
+
+**Без `make`** (Windows, где его обычно нет) — тот же цикл семью командами; проверено на чистом клоне:
+
+```bash
+export MASTER_SALT=demo-salt-not-a-secret   # PowerShell: $env:MASTER_SALT="demo-salt-not-a-secret"
+docker compose -f docker/docker-compose.yml build tool
+docker compose -f docker/docker-compose.yml up -d demo-db staging-db
+docker compose -f docker/docker-compose.yml run --rm tool python -m sanitizer.cli demo-seed --dsn postgresql://demo:demo@demo-db:5432/demo
+docker compose -f docker/docker-compose.yml run --rm tool python -m sanitizer.cli plan --dsn postgresql://demo:demo@demo-db:5432/demo --auto-approve
+docker compose -f docker/docker-compose.yml run --rm tool python -m sanitizer.cli run  --dsn postgresql://demo:demo@demo-db:5432/demo
+docker compose -f docker/docker-compose.yml run --rm tool python -m sanitizer.cli restore --host staging-db --port 5432
+docker compose -f docker/docker-compose.yml run --rm tool python -m sanitizer.cli verify --src-dsn postgresql://demo:demo@demo-db:5432/demo --dst-dsn postgresql://staging:staging@staging-db:5432/staging
+```
+
+Полный набор тестов (нужны поднятые БД): `docker compose -f docker/docker-compose.yml run --rm tool python -m pytest tests -q`.
 
 Интерактивный гейт (вместо автоаппрува): `python -m sanitizer.cli plan` без `--auto-approve` — конвейер остановится, покажет черновик плана, дифф и блокеры; решения задаются в `sanitizer/demo/plan-config.json` (`overrides` — это и есть зафиксированные решения человека).
 
