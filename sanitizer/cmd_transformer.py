@@ -148,9 +148,17 @@ class RowTransformer:
         return val
 
     def _jsonb(self, val: str, fields: dict[str, str]) -> str:
+        """Обход идёт по КЛЮЧАМ ДАННЫХ, а не по разметке: ключ, появившийся после
+        планирования, иначе уезжает в staging нетронутым. Для него действует то же
+        правило, что для неразмеченной колонки - не знаем, значит не пропускаем
+        (разбор 4, находка 3А). Дрейф ловится раньше: json_keys входят в отпечаток схемы."""
         data = json.loads(val)
-        for key, ftype in fields.items():
-            if key not in data or data[key] is None:
+        for key in list(data):
+            ftype = fields.get(key)
+            if ftype is None:
+                data[key] = None
+                continue
+            if data[key] is None:
                 continue
             match ftype:
                 case "phone":

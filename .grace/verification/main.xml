@@ -14,23 +14,23 @@
     </V-M-DEMO-DB>
     <V-M-PROFILER>
       <Command>python -m pytest tests/integration/test_profiler.py -q</Command>
-      <Evidence>7 passed против демо-базы: счётчики, UNIQUE/NOT NULL, композитный FK через pg_constraint, ключи jsonb, метрика разбираемости адресов, детерминизм снимка.</Evidence>
+      <Evidence>8 passed против демо-базы: счётчики, UNIQUE/NOT NULL, композитный FK через pg_constraint, ключи jsonb, метрика разбираемости адресов, детерминизм снимка. Плюс негативный тест на ложный первичный ключ: во временной схеме FK назван так же, как PK соседней таблицы; старый join (без table_name) выдавал строку ('a','email','PRIMARY KEY') - проверено исполнением, - и колонка email становилась ключом, что вместе с находкой 1 отправляло её в keep.</Evidence>
     </V-M-PROFILER>
     <V-M-CLASSIFIER>
-      <Command>python -m pytest tests/unit/test_classifier.py tests/integration/test_classifier_db.py -q</Command>
-      <Evidence>8 + 5 passed. КРИТЕРИЙ §7 ИЗМЕРЕН на демо-базе: recall 1.000, precision 0.958 при порогах 0.98/0.85; размечено 23 чувствительных колонки из 69 (критерий просит набор >=200 - на реальной базе он должен быть шире). Пропусков ПДн нет; единственное «ложное» срабатывание - f_115, ушедшая в unresolved, то есть правильное поведение fail-closed. Подтверждено: типы с контрольной суммой распознаются правилами без LLM; колонка с врущим именем (city с полными адресами) не теряется.</Evidence>
+      <Command>python -m pytest tests/unit/test_classifier.py tests/unit/test_leak_paths.py tests/integration/test_classifier_db.py -q</Command>
+      <Evidence>8 + 12 + 5 passed. Признак ключа больше не глушит голоса (tests/unit/test_leak_paths.py): колонка email под PRIMARY KEY классифицируется как email - раньше становилась technical/keep при уверенности правил 1.0; суррогатный целочисленный ключ остаётся техническим. КРИТЕРИЙ §7 ИЗМЕРЕН на демо-базе: recall 1.000, precision 0.958 при порогах 0.98/0.85; размечено 23 чувствительных колонки из 69 (критерий просит набор >=200 - на реальной базе он должен быть шире). Пропусков ПДн нет; единственное «ложное» срабатывание - f_115, ушедшая в unresolved, то есть правильное поведение fail-closed. Подтверждено: типы с контрольной суммой распознаются правилами без LLM; колонка с врущим именем (city с полными адресами) не теряется.</Evidence>
     </V-M-CLASSIFIER>
     <V-M-FK-CLOSURE>
       <Command>python -m pytest tests/unit/test_fk_closure.py -q</Command>
       <Evidence>4 passed: простые и композитные FK поколоночно, транзитивное замыкание, мягкая связь по вложенности доменов без ложных срабатываний на email.</Evidence>
     </V-M-FK-CLOSURE>
     <V-M-POLICY>
-      <Command>python -m pytest tests/unit/test_policy.py -q</Command>
-      <Evidence>7 passed: назначение стратегий по осям, наследование классом, fail-closed (ПДн в direct, unresolved, null без подтверждения, jsonb без разметки, дрейф схемы с именем колонки, частотная атака только для категориальных), dump/load/diff.</Evidence>
+      <Command>python -m pytest tests/unit/test_policy.py tests/unit/test_leak_paths.py -q</Command>
+      <Evidence>7 + 12 passed: назначение стратегий по осям, наследование классом, fail-closed (ПДн в direct, unresolved, null без подтверждения, jsonb без разметки, дрейф схемы с именем колонки, частотная атака только для категориальных), dump/load/diff. Тесты путей утечки (разбор 4): ключ-ПДн с инъективной заменой уходит в generate, без неё - в unresolved; валидация краснеет на сохранённом ключе-ПДн; неразмеченный ключ jsonb блокирует план и меняет отпечаток схемы (без ключей в отпечатке два разных снимка давали один хэш f867515e7c173f7e).</Evidence>
     </V-M-POLICY>
     <V-M-PLAN-GRAPH>
       <Command>python -m pytest tests/integration/test_plan_graph.py -q</Command>
-      <Evidence>3 passed: interrupt-гейт останавливает и возобновляется через Command(resume), автоаппрув даёт валидный план с ожидаемыми стратегиями по враждебным случаям, повторный прогон при неизменной схеме - пустой дифф.</Evidence>
+      <Evidence>5 passed: interrupt-гейт останавливает и возобновляется через Command(resume), автоаппрув даёт валидный план с ожидаемыми стратегиями по враждебным случаям, повторный прогон при неизменной схеме - пустой дифф. Плюс два теста на гейт как механизм: аппрув без списка подтверждений оставляет generalize заблокированным (раньше confirm не читался нигде), а подтверждение с гейта помечается human против ci в автоаппруве. Путь черновика в сообщении гейта проверен на существование файла - раньше в нём было имя plan.yaml.draft.yaml вместо plan.draft.yaml.</Evidence>
     </V-M-PLAN-GRAPH>
     <V-M-EXECUTOR>
       <Command>python -m pytest tests/unit/test_executor.py tests/integration/test_executor.py -q</Command>

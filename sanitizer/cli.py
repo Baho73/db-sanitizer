@@ -57,8 +57,13 @@ def cmd_plan(a) -> int:
              "json_map": cfg.get("json_map", {}),
              "sensitive_categories": cfg.get("sensitive_categories", []),
              "overrides": cfg.get("overrides", {}),
+             "confirm": cfg.get("confirm", []),
              "plan_path": a.plan, "auto_approve": a.auto_approve}
-    out = run_planning(build_graph(), state)
+    try:
+        out = run_planning(build_graph(), state)
+    except ValueError as e:  # запрещённый override - решение человека вне гейта
+        print(f"КОНФИГ ОТКЛОНЁН (fail-closed): {e}")
+        return 1
     if "__interrupt__" in out:
         payload = out["__interrupt__"][0].value
         print("ГЕЙТ: план ждёт аппрува.")

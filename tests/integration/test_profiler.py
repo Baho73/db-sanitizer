@@ -57,6 +57,26 @@ def test_determinism(snap):
     assert snap.to_json() == again.to_json()
 
 
+def test_fk_named_like_foreign_pk_does_not_forge_pk():
+    """Разбор 4, находка 2: имя ограничения уникально только внутри таблицы.
+    FK, названный как PK соседней таблицы, помечал чужую колонку первичным ключом."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("DROP SCHEMA IF EXISTS fkname CASCADE; CREATE SCHEMA fkname")
+        # a.email - обычная колонка; имя её таблицы приходит из table_constraints,
+        # имя колонки email - из key_column_usage чужого ограничения-тёзки
+        c.execute("CREATE TABLE fkname.a (id int CONSTRAINT x_key PRIMARY KEY, "
+                  "email varchar(80) UNIQUE)")
+        c.execute("CREATE TABLE fkname.b (email varchar(80) CONSTRAINT x_key "
+                  "REFERENCES fkname.a(email))")
+        c.execute("INSERT INTO fkname.a VALUES (1, 'user1@rusal.ru')")
+        try:
+            snap = profile(DSN, "fkname")
+            assert not snap.col("fkname.a.email").is_pk
+            assert snap.col("fkname.a.id").is_pk
+        finally:
+            c.execute("DROP SCHEMA fkname CASCADE")
+
+
 def test_addr_parser_unit():
     assert addr_parse_ratio(["Тверская область, г. Ржев, ул. Садовая, д. 5"]) == 1.0
     assert addr_parse_ratio(["мск, тверскя 5 кв 12, спросить Марью, домофон 1234"]) == 0.0

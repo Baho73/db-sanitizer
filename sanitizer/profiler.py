@@ -99,8 +99,11 @@ _CONSTRAINTS_SQL = """
 SELECT tc.table_schema || '.' || tc.table_name, kcu.column_name, tc.constraint_type
 FROM information_schema.table_constraints tc
 JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
- AND kcu.table_schema = tc.table_schema
+ AND kcu.table_schema = tc.table_schema AND kcu.table_name = tc.table_name
 WHERE tc.table_schema = %s AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')"""
+# table_name в join обязателен: имя ограничения уникально только внутри таблицы.
+# Без него FK, названный как PK соседней таблицы, порождает строку-фантом и
+# помечает чужую колонку как первичный ключ (разбор 4, находка 2).
 
 # pg_constraint вместо information_schema: constraint_column_usage теряет порядок
 # колонок и даёт декартово произведение на композитных FK.

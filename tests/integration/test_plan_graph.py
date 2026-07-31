@@ -30,6 +30,7 @@ def make_state(plan_path: Path, auto: bool) -> dict:
         "json_map": CONFIG["json_map"],
         "sensitive_categories": CONFIG["sensitive_categories"],
         "overrides": CONFIG["overrides"],
+        "confirm": CONFIG["confirm"],
         "plan_path": str(plan_path),
         "auto_approve": auto,
     }
@@ -43,9 +44,29 @@ def test_gate_interrupts_then_resume(tmp_path):
     assert not plan_path.exists()               # финального плана ещё нет
     payload = result["__interrupt__"][0].value
     assert "plan_draft" in payload
-    out = resume_approved(graph, thread_id="t1")
+    assert payload["plan_draft"].endswith(".draft.yaml")  # путь черновика реальный
+    assert Path(payload["plan_draft"]).exists()
+    out = resume_approved(graph, thread_id="t1", confirm=CONFIG["confirm"])
     assert out["errors"] == []
     assert plan_path.exists()                   # продолжение после аппрува дописало план
+    # подтверждение пришло с гейта и помечено человеком, а не конфигом
+    confirmed = Plan.load(plan_path).columns["hr.employees.birth_date"]
+    assert confirmed.confirmed and confirmed.confirmed_by == "human"
+
+
+def test_gate_without_confirmation_blocks_irreversible_strategy(tmp_path):
+    """Разбор 4, находка 4: без подтверждения на гейте generalize не проходит."""
+    graph = build_graph()
+    run_planning(graph, make_state(tmp_path / "plan.yaml", auto=False), thread_id="t5")
+    out = resume_approved(graph, thread_id="t5")          # аппрув без confirm
+    assert any("birth_date" in e and "confirmation" in e for e in out["errors"])
+
+
+def test_auto_approve_marks_confirmation_as_machine(tmp_path):
+    plan_path = tmp_path / "plan.yaml"
+    run_planning(build_graph(), make_state(plan_path, auto=True), thread_id="t6")
+    pc = Plan.load(plan_path).columns["hr.employees.birth_date"]
+    assert pc.confirmed and pc.confirmed_by == "ci"        # видно, что человека не было
 
 
 def test_auto_approve_produces_valid_plan(tmp_path):

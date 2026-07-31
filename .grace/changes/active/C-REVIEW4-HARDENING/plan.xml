@@ -1,0 +1,130 @@
+<GraceChangePlan graceVersion="4.0" status="approved">
+  <C-REVIEW4-HARDENING>
+    <IntentSummary>Идти рангами разбора 4 по убыванию вреда, а не по удобству правки. Ранг 1 - четыре пути утечки: они опаснее всего именно потому, что невидимы для всех восьми проверок сразу. Ранг 2 - механизмы, которых физически нет: заявленная защита, которой не существует, хуже отсутствующей, потому что на неё рассчитывают. Ранг 3 - порча данных и зашитая схема: инструмент даёт негодную копию или не собирается на чужой базе. Ранг 4 - документы. Сквозной задачей идёт враждебная демо-база: без ломающих случаев тесты измеряют подбор данных, а не поведение кода.</IntentSummary>
+    <BaselineAssertions>
+      <MustExist>
+        <Value>docs/design-review-4.md</Value>
+        <Value>sanitizer/classifier.py</Value>
+        <Value>sanitizer/policy.py</Value>
+        <Value>sanitizer/plan_graph.py</Value>
+        <Value>.grace/graph/main.xml</Value>
+      </MustExist>
+    </BaselineAssertions>
+    <TargetAssertions>
+      <MustVerify>
+        <Module>M-CLASSIFIER</Module>
+        <Module>M-PROFILER</Module>
+        <Module>M-POLICY</Module>
+        <Module>M-PLAN-GRAPH</Module>
+        <Module>M-EXECUTOR</Module>
+        <Module>M-POSTPROC</Module>
+        <Module>M-MAPPER</Module>
+        <Module>M-CORPUS</Module>
+        <Module>M-VERIFIER</Module>
+        <Module>M-RUNLOG</Module>
+        <Module>M-DEMO-DB</Module>
+        <Module>M-CLI</Module>
+      </MustVerify>
+      <MustPassCommand>
+        <Command>python -m pytest tests/unit -q</Command>
+      </MustPassCommand>
+    </TargetAssertions>
+    <DurableScope>
+      <VerificationAnchors>
+        <V-M-CLASSIFIER />
+        <V-M-PROFILER />
+        <V-M-POLICY />
+        <V-M-PLAN-GRAPH />
+        <V-M-EXECUTOR />
+        <V-M-POSTPROC />
+        <V-M-MAPPER />
+        <V-M-CORPUS />
+        <V-M-VERIFIER />
+        <V-M-RUNLOG />
+        <V-M-DEMO-DB />
+        <V-M-CLI />
+      </VerificationAnchors>
+    </DurableScope>
+    <ObservedWriteScope>
+      <Glob>sanitizer/**</Glob>
+      <Glob>tests/**</Glob>
+      <Glob>docs/**</Glob>
+      <Glob>.grace/**</Glob>
+      <File>README.md</File>
+      <File>Makefile</File>
+      <File>docker/docker-compose.yml</File>
+    </ObservedWriteScope>
+    <ImplementationPlan>
+      <T-001>
+        <Title>Ранг 1: закрыть четыре пути утечки персональных данных</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Признак первичного ключа перестаёт отменять голоса классификатора: суррогатным ключ считается только когда оба голоса молчат и тип целочисленный либо uuid.</Criterion>
+          <Criterion>Колонка-ключ с персональными данными получает инъективную замену (generate) либо уходит в unresolved; валидация ловит план, где ключ-ПДн сохранён или заменён неинъективно.</Criterion>
+          <Criterion>Join ограничений соединяется по имени таблицы: FK-тёзка первичного ключа соседней таблицы больше не помечает чужую колонку ключом.</Criterion>
+          <Criterion>Ключи jsonb входят в отпечаток схемы; неразмеченный ключ блокирует план; трансформер обходит ключи данных, а не разметки, и не пропускает неизвестный ключ.</Criterion>
+          <Criterion>Белый список полей override; confirmed и confirmed_by в него не входят; подтверждение выдаётся на гейте и несёт автора; дифф не сравнивает поля аудита.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_leak_paths.py tests/integration/test_profiler.py tests/integration/test_plan_graph.py -q</Command>
+        </Verification>
+      </T-001>
+      <T-002>
+        <Title>Ранг 2: заявленные механизмы - в код либо в отклонения</Title>
+        <DependsOn>T-001</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Валидатор корпусов вызывается конвейером, а не только тестами; негодный корпус останавливает прогон.</Criterion>
+          <Criterion>Гейт публикации становится механизмом: подкоманда публикации переносит дамп и отказывается это делать при неуспешной верификации.</Criterion>
+          <Criterion>Отсутствие LLM зафиксировано как отклонение в контексте GRACE и в документах; ложные обещания из README и compose убраны.</Criterion>
+          <Criterion>Отсутствие соли в окружении диагностируется, а не подставляется публично известным умолчанием.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit -q</Command>
+        </Verification>
+      </T-002>
+      <T-003>
+        <Title>Ранг 3: порча данных и переносимость на чужую схему</Title>
+        <DependsOn>T-002</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>10-значный ИНН получает валидную контрольную сумму; паспорт заменяется инъективно.</Criterion>
+          <Criterion>Целое в диапазоне не коллидирует за пределами окна: домен перестановки покрывает исходные значения, выход за домен - явная ошибка.</Criterion>
+          <Criterion>Экранирование COPY переживает round-trip на обратном слэше.</Criterion>
+          <Criterion>Связанные денежные колонки перемешиваются согласованно по классу эквивалентности либо расхождение объявлено планом.</Criterion>
+          <Criterion>NULL остаётся NULL во всех ветках трансформера, включая ФИО.</Criterion>
+          <Criterion>length_policy исполняется, а не декларируется: переполнение колонки ловится до restore.</Criterion>
+          <Criterion>Схема задаётся флагом и доходит до профилировщика, исполнителя и верификатора; демо-специфика вынесена из проверок.</Criterion>
+          <Criterion>Демо-база содержит враждебные случаи по каждой находке: 10-значные ИНН, табельные вне окна, обратный слэш в тексте, связь зарплата-начисления, NULL в отчестве.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit tests/integration -q</Command>
+        </Verification>
+      </T-003>
+      <T-004>
+        <Title>Ранг 4: согласовать документы с кодом, закрыть узкие случаи</Title>
+        <DependsOn>T-003</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Из документов и контрактов убраны утверждения про Presidio и про LLM в конвейере; замена и разрыв записаны как решения.</Criterion>
+          <Criterion>Наследование стратегии классом не переписывает тип: КПП не попадает в ветку названия организации.</Criterion>
+          <Criterion>Строки SQL, склеиваемые из данных, экранируются; список типов в запросе строится параметрами, а не repr кортежа.</Criterion>
+          <Criterion>Пороги плана читаются из params, а не из констант модуля.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit tests/integration -q</Command>
+        </Verification>
+      </T-004>
+      <T-005>
+        <Title>Согласовать durable-состояние, V-модель и провести разбор результата</Title>
+        <DependsOn>T-004</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Граф и свидетельства верификации отражают фактическое поведение модулей после правок, включая новые функции в MODULE_MAP.</Criterion>
+          <Criterion>Матрица docs/module-status.md содержит новые тесты и честные отметки готовности.</Criterion>
+          <Criterion>Пятый разбор проверяет результат работы и записан в docs/design-review-5.md.</Criterion>
+          <Criterion>grace lint без ошибок.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit tests/integration tests/e2e -q</Command>
+        </Verification>
+      </T-005>
+    </ImplementationPlan>
+  </C-REVIEW4-HARDENING>
+</GraceChangePlan>

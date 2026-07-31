@@ -9,6 +9,7 @@
 #
 # START_MODULE_MAP
 #   PlanState - состояние графа планирования
+#   apply_overrides - наложить разметку человека по белому списку полей
 #   build_graph - собрать StateGraph с checkpointer
 #   run_planning - выполнить до гейта; вернуть паузу или готовый план
 #   resume_approved - продолжить после аппрува (Command(resume=...))
@@ -38,7 +39,9 @@ class PlanState(TypedDict, total=False):
     sensitive_categories: list[str]
     plan_path: str          # куда писать sanitization-plan.yaml
     auto_approve: bool      # CI-режим; пометка в отчёте
-    overrides: dict         # решения человека по unresolved/generalize: колонка -> поля PlanColumn
+    overrides: dict         # решения человека по unresolved: колонка -> поля PlanColumn
+    confirm: list[str]      # колонки, подтверждённые на гейте (null/generalize)
+    confirmed_by: str       # human|ci - кто дал подтверждение
     snapshot_json: str
     errors: list[str]
     approved: bool
@@ -47,10 +50,32 @@ class PlanState(TypedDict, total=False):
 
 _SNAP_CACHE: dict[str, Snapshot] = {}  # snapshot непереносим в JSON-состояние целиком
 
+# Поля PlanColumn, которые человек вправе переопределить конфигом. `confirmed`
+# и `confirmed_by` сюда НЕ входят: подтверждение выдаётся только на гейте, иначе
+# неподписанный JSON подделывает человеческое решение (разбор 4, находка 4).
+_OVERRIDABLE = {"sem_type", "strategy", "llm_mode", "reason", "json_fields", "length_policy"}
 
 
 
 
+
+
+
+# START_CONTRACT: apply_overrides
+#   PURPOSE: Наложить разметочные решения человека на план. Белый список полей -
+#            единственная защита от подделки подтверждения неподписанным JSON.
+#   INPUTS: { plan: Plan, overrides: dict колонка -> поля PlanColumn }
+#   OUTPUTS: { none - план меняется на месте }
+#   SIDE_EFFECTS: ValueError на неизвестной колонке или запрещённом поле (fail-closed)
+# END_CONTRACT: apply_overrides
+def apply_overrides(plan: Plan, overrides: dict) -> None:
+    for col, fields in overrides.items():
+        if col not in plan.columns:
+            raise ValueError(f"override для неизвестной колонки {col}")
+        for k, v in fields.items():
+            if k not in _OVERRIDABLE:
+                raise ValueError(f"override {col}.{k} запрещён; разрешено: {sorted(_OVERRIDABLE)}")
+            setattr(plan.columns[col], k, v)
 
 
 def _node_profile(state: PlanState) -> dict:
@@ -68,10 +93,7 @@ def _node_classify_and_assign(state: PlanState) -> dict:
                   json_map=state.get("json_map", {}))
     # решения человека применяются ДО диффа и гейта: ревьюер видит итог,
     # а повторный прогон при неизменной схеме даёт пустой дифф
-    for col, fields in (state.get("overrides") or {}).items():
-        if col in plan.columns:
-            for k, v in fields.items():
-                setattr(plan.columns[col], k, v)
+    apply_overrides(plan, state.get("overrides") or {})
     plan.soft_links_pending = [[a, b] for a, b, _ in soft_links(snap)]
     old_path = Path(state["plan_path"])
     diff = plan_diff(Plan.load(old_path), plan) if old_path.exists() else {}
@@ -83,19 +105,27 @@ def _node_gate(state: PlanState) -> dict:
     """Человеческий гейт. interrupt() останавливает граф с сохранением состояния;
     продолжение - Command(resume={"approve": bool, "confirm": [колонки]})."""
     if state.get("auto_approve"):
-        return {"approved": True}
+        # CI-режим: подтверждения берутся из конфига и помечаются машинными -
+        # в самом плане видно, что человека на гейте не было
+        return {"approved": True, "confirm": list(state.get("confirm") or []), "confirmed_by": "ci"}
     answer = interrupt({
-        "plan_draft": state["plan_path"] + ".draft.yaml",
+        "plan_draft": str(Path(state["plan_path"]).with_suffix(".draft.yaml")),
         "diff": state.get("diff", {}),
         "validation_errors": state.get("errors", []),
     })
-    return {"approved": bool(answer.get("approve"))}
+    return {"approved": bool(answer.get("approve")),
+            "confirm": list(answer.get("confirm") or []), "confirmed_by": "human"}
 
 
 def _node_finalize(state: PlanState) -> dict:
     draft = Path(state["plan_path"]).with_suffix(".draft.yaml")
     plan = Plan.load(draft)
     snap = _SNAP_CACHE[state["dsn"]]
+    for col in state.get("confirm") or []:
+        if col not in plan.columns:
+            return {"errors": [f"подтверждение для неизвестной колонки {col}"], "approved": False}
+        plan.columns[col].confirmed = True
+        plan.columns[col].confirmed_by = state.get("confirmed_by") or "human"
     errors = validate_plan(plan, snap)
     if errors:
         return {"errors": errors, "approved": False}

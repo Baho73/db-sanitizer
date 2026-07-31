@@ -42,7 +42,8 @@ class PlanColumn:
     strategy: str            # direct|fake|generate|generalize|shuffle|keep|null|freetext|jsonb|unresolved
     llm_mode: str            # direct|corpus|none
     reason: str
-    confirmed: bool = False  # обязателен для null/generalize; проставляется на гейте
+    confirmed: bool = False  # обязателен для null/generalize; проставляется ТОЛЬКО на гейте
+    confirmed_by: str = ""   # human|ci - кто подтвердил; пусто = не подтверждено
     json_fields: dict[str, str] = field(default_factory=dict)
     length_policy: str = "fail"  # truncate|widen|fail - для freetext (§5.5)
 
@@ -72,8 +73,18 @@ class Plan:
 
 
 def schema_fingerprint(snap: Snapshot) -> str:
-    payload = "|".join(f"{c.qualified}:{c.data_type}" for c in sorted(snap.columns, key=lambda c: c.qualified))
+    # json_keys входят в отпечаток наравне с колонками: новый ключ внутри jsonb -
+    # такой же дрейф схемы, как новая колонка, и без него он уезжает мимо гейта
+    # (разбор 4, находка 3Б).
+    payload = "|".join(f"{c.qualified}:{c.data_type}:{','.join(c.json_keys)}"
+                       for c in sorted(snap.columns, key=lambda c: c.qualified))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+# Семантические типы, для которых генерация структурно инъективна (перестановка
+# Фейстеля или 40-битный суффикс). Только они допустимы на колонке-ключе.
+_UNIQUE_SAFE = {SemType.INN, SemType.SNILS, SemType.OGRN, SemType.EMAIL,
+                SemType.PERSON_ID}
 
 
 
@@ -117,9 +128,19 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
         strategy, mode = _STRATEGY[st]
         reason = cc.reason
         if info.data_type == "jsonb":
+            # Внутри jsonb действует то же правило, что для колонок: каждый ключ
+            # должен быть размечен явно. Неразмеченный ключ - не «оставить как есть»,
+            # а повод остановить план (разбор 4, находка 3А).
             fields = (json_map or {}).get(cc.column, {})
-            cols[cc.column] = PlanColumn(str(st), "jsonb" if fields else "unresolved",
-                                         "none", "jsonb", json_fields=fields)
+            unmapped = sorted(set(info.json_keys) - set(fields))
+            if not fields:
+                cols[cc.column] = PlanColumn(str(st), "unresolved", "none", "jsonb без разметки")
+            elif unmapped:
+                cols[cc.column] = PlanColumn(str(st), "unresolved", "none",
+                                             f"jsonb: неразмеченные ключи {unmapped}",
+                                             json_fields=fields)
+            else:
+                cols[cc.column] = PlanColumn(str(st), "jsonb", "none", "jsonb", json_fields=fields)
             continue
         if st == SemType.ADDRESS and (info.addr_parse_ratio or 0) < ADDR_PARSE_THRESHOLD:
             strategy, mode, reason = "freetext", "none", f"addr_parse={info.addr_parse_ratio}"  # §3.2 п.3
@@ -133,6 +154,15 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
             strategy, mode, reason = "fake", "corpus", "direct-forbidden"      # §3.1
         if strategy == "generate" and st == SemType.EMAIL and not info.is_unique:
             strategy, mode = "fake", "corpus"
+        # Колонка-ключ с персональными данными (PRIMARY KEY (snils), UNIQUE (email)):
+        # замена обязана остаться инъективной. Иначе UNIQUE падает на restore, а
+        # «починка» дублей означает сохранение части исходных значений (находка 1).
+        if (info.is_pk or info.is_unique) and st in PII_TYPES:
+            if st in _UNIQUE_SAFE:
+                strategy, mode, reason = "generate", "none", f"{reason}; ключ-ПДн -> инъективная замена"
+            else:
+                strategy, mode, reason = "unresolved", "none", \
+                    f"ключ-ПДн типа {st}: инъективной замены нет, нужно решение человека"
         cols[cc.column] = PlanColumn(str(st), strategy, mode, reason)
 
     classes = [sorted(c) for c in equivalence_classes(snap)]
@@ -162,27 +192,31 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
 # END_CONTRACT: validate_plan
 def validate_plan(plan: Plan, snap: Snapshot) -> list[str]:
     errors: list[str] = []
+    by_name = {c.qualified: c for c in snap.columns}
+    pii_str = {str(t) for t in PII_TYPES}
     if plan.schema_fingerprint != schema_fingerprint(snap):
-        snap_cols = {c.qualified for c in snap.columns}
-        missing = snap_cols - set(plan.columns)
+        missing = set(by_name) - set(plan.columns)
         errors.append(f"schema drift: fingerprint mismatch; columns not in plan: {sorted(missing)[:5]}")
     for name, pc in plan.columns.items():
         if pc.strategy == "unresolved":
             errors.append(f"{name}: unresolved ({pc.reason})")
-        if pc.strategy == "direct" and pc.sem_type in {str(t) for t in PII_TYPES}:
+        if pc.strategy == "direct" and pc.sem_type in pii_str:
             errors.append(f"{name}: PII type {pc.sem_type} in direct mode is forbidden")
-        if pc.strategy in ("null", "generalize") and not pc.confirmed:
+        if pc.strategy in ("null", "generalize") and not (pc.confirmed and pc.confirmed_by):
             errors.append(f"{name}: strategy {pc.strategy} requires human confirmation")
+        info = by_name.get(name)
+        if info is not None and (info.is_pk or info.is_unique) and pc.sem_type in pii_str \
+                and pc.strategy not in ("generate", "unresolved"):
+            errors.append(f"{name}: ключ-ПДн ({pc.sem_type}) со стратегией {pc.strategy} - "
+                          f"замена неинъективна, UNIQUE не удержится")
         if pc.strategy == "fake":
             # частотная атака (§5.6) актуальна для типов с ПУБЛИЧНО известным
             # распределением; для компонент ФИО риск принят явно (§6.2)
-            if pc.sem_type in ("category", "city", "region", "org_name"):
-                try:
-                    card = snap.col(name).cardinality
-                    if card < plan.params.get("fake_min_cardinality", FAKE_MIN_CARD):
-                        errors.append(f"{name}: fake at cardinality {card} < min - frequency attack (§5.6)")
-                except StopIteration:
+            if pc.sem_type in ("category", "city", "region", "org_name", "kpp"):
+                if info is None:
                     errors.append(f"{name}: column vanished from schema")
+                elif info.cardinality < plan.params.get("fake_min_cardinality", FAKE_MIN_CARD):
+                    errors.append(f"{name}: fake at cardinality {info.cardinality} < min - frequency attack (§5.6)")
     for cls in plan.classes:
         strategies = {plan.columns[c].strategy for c in cls if c in plan.columns}
         if len(strategies - {"keep"}) > 1:
@@ -190,13 +224,25 @@ def validate_plan(plan: Plan, snap: Snapshot) -> list[str]:
     return errors
 
 
+_AUDIT_FIELDS = ("confirmed", "confirmed_by")
+
+
+def _decision(pc: PlanColumn) -> dict:
+    """Решение о замене без полей аудита: кто подтвердил - не часть решения."""
+    return {k: v for k, v in asdict(pc).items() if k not in _AUDIT_FIELDS}
+
+
 def plan_diff(old: Plan, new: Plan) -> dict[str, str]:
-    """Колонка -> added|changed. Неизменённые не показываются (§3.5)."""
+    """Колонка -> added|changed. Неизменённые не показываются (§3.5).
+    Подтверждение проставляется на гейте, то есть ПОСЛЕ черновика, по которому
+    считается дифф. Сравнивать его здесь значит показывать «changed» на каждом
+    прогоне и приучать ревьюера пролистывать дифф не читая. Утрата подтверждения
+    ловится не диффом, а валидацией (она блокирует план)."""
     out: dict[str, str] = {}
     for name, pc in new.columns.items():
         if name not in old.columns:
             out[name] = "added"
-        elif asdict(pc) != asdict(old.columns[name]):
+        elif _decision(pc) != _decision(old.columns[name]):
             out[name] = "changed"
     return out
 

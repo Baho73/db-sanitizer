@@ -17,12 +17,12 @@
     </M-DEMO-DB>
     <M-PROFILER>
       <Path>sanitizer/profiler.py</Path>
-      <Purpose>Интроспекция каталога: колонки, ограничения, FK-граф через pg_constraint (композитные корректно), статистика одним запросом на таблицу, ключи jsonb, метрика разбираемости адресов.</Purpose>
+      <Purpose>Интроспекция каталога: колонки, ограничения, FK-граф через pg_constraint (композитные корректно), статистика одним запросом на таблицу, ключи jsonb, метрика разбираемости адресов. Join ограничений идёт по схеме И имени таблицы: имя ограничения уникально только внутри таблицы, и без этого FK-тёзка первичного ключа соседней таблицы помечал чужую колонку ключом.</Purpose>
       <DependsOn></DependsOn>
     </M-PROFILER>
     <M-CLASSIFIER>
       <Path>sanitizer/classifier.py</Path>
-      <Purpose>Два независимых голоса: правила по значениям (КС ИНН/СНИЛС/ОГРН; паспорт/КПП по формату+якорям) и LLM по метаданным с кэшем. Расхождение или слепота обоих -> unresolved.</Purpose>
+      <Purpose>Два независимых голоса: правила по значениям (КС ИНН/СНИЛС/ОГРН; паспорт/КПП по формату+якорям) и LLM по метаданным с кэшем. Расхождение или слепота обоих -> unresolved. Признак ключа НЕ отменяет голоса: суррогатным считается только целочисленный/uuid ключ, на котором оба голоса молчат, - иначе PRIMARY KEY (snils) уезжает в keep.</Purpose>
       <DependsOn><M-MAPPER /><M-PROFILER /></DependsOn>
     </M-CLASSIFIER>
     <M-FK-CLOSURE>
@@ -32,17 +32,17 @@
     </M-FK-CLOSURE>
     <M-POLICY>
       <Path>sanitizer/policy.py</Path>
-      <Purpose>Стратегия и LLM-режим по осям чувствительность×кардинальность; модель sanitization-plan.yaml; fail-closed валидация (ПДн в direct, fake на категориях малой кардинальности, null/generalize без подтверждения, jsonb без разметки, дрейф схемы); дифф планов.</Purpose>
+      <Purpose>Стратегия и LLM-режим по осям чувствительность×кардинальность; модель sanitization-plan.yaml; fail-closed валидация (ПДн в direct, fake на категориях малой кардинальности, null/generalize без подтверждения и без автора, jsonb без разметки или с неразмеченным ключом, ключ-ПДн с неинъективной заменой, дрейф схемы); дифф планов по решениям, без полей аудита. Отпечаток схемы включает ключи jsonb: новый ключ внутри jsonb - такой же дрейф, как новая колонка.</Purpose>
       <DependsOn><M-CLASSIFIER /><M-FK-CLOSURE /><M-PROFILER /></DependsOn>
     </M-POLICY>
     <M-PLAN-GRAPH>
       <Path>sanitizer/plan_graph.py</Path>
-      <Purpose>LangGraph-конвейер планирования: profile -> classify+assign (+overrides человека до диффа) -> interrupt-гейт -> finalize. Checkpointer, продолжение через Command(resume).</Purpose>
+      <Purpose>LangGraph-конвейер планирования: profile -> classify+assign (+overrides человека до диффа, по белому списку полей) -> interrupt-гейт -> finalize. Checkpointer, продолжение через Command(resume). Подтверждение необратимых стратегий проставляется ТОЛЬКО на гейте и несёт автора (human|ci): через конфиг оно неподделываемо, потому что confirmed вне белого списка.</Purpose>
       <DependsOn><M-PROFILER /><M-CLASSIFIER /><M-FK-CLOSURE /><M-POLICY /><M-CORPUS /></DependsOn>
     </M-PLAN-GRAPH>
     <M-EXECUTOR>
       <Path>sanitizer/executor.py, sanitizer/cmd_transformer.py</Path>
-      <Purpose>Проход 1: артефакты (direct-карты, shuffle-перестановки с детерминированным seed), генерация config.yml Greenmask (классы только через Cmd), запуск dump; Cmd-процесс - протокол json-строк, SIGTERM->exit 0, пропуск строки метаданных.</Purpose>
+      <Purpose>Проход 1: артефакты (direct-карты, shuffle-перестановки с детерминированным seed), генерация config.yml Greenmask (классы только через Cmd), запуск dump; Cmd-процесс - протокол json-строк, SIGTERM->exit 0, пропуск строки метаданных. Внутри jsonb обход идёт по ключам ДАННЫХ, а не разметки: неразмеченный ключ обнуляется, а не пропускается нетронутым.</Purpose>
       <DependsOn><M-MAPPER /><M-CORPUS /><M-POLICY /><M-RUNLOG /></DependsOn>
     </M-EXECUTOR>
     <M-POSTPROC>

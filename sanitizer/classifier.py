@@ -173,8 +173,14 @@ def classify(cols: list[ColumnInfo], llm_votes: dict[str, tuple[SemType | None, 
     for col in cols:
         r_type, r_conf = rules_detect(col)
         l_type, l_conf = llm_votes.get(col.qualified, (None, 0.0))
-        if col.is_pk or (col.data_type in ("integer", "bigint") and col.name.endswith("_id")):
-            out.append(ClassifiedColumn(col.qualified, SemType.TECHNICAL, 1.0, False, "pk/fk"))
+        # Суррогатный ключ - признак служебной колонки ТОЛЬКО когда ни один голос
+        # не увидел смысла. `is_pk` означает «нельзя ломать уникальность», а не
+        # «это не персональные данные»: PRIMARY KEY (snils) - обычная практика,
+        # и такая колонка обязана пройти обычное сведение голосов (разбор 4, находка 1).
+        surrogate = ((col.is_pk or col.name.endswith("_id"))
+                     and col.data_type in ("integer", "bigint", "smallint", "uuid"))
+        if surrogate and r_type is None and l_type is None:
+            out.append(ClassifiedColumn(col.qualified, SemType.TECHNICAL, 1.0, False, "pk/fk-surrogate"))
         elif r_type and l_type and r_type == l_type:
             out.append(ClassifiedColumn(col.qualified, r_type, max(r_conf, l_conf), False, "agree"))
         elif r_type and l_type:  # расхождение по существу -> всегда человеку (§4.3)
