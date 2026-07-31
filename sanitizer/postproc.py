@@ -91,11 +91,19 @@ class TextSanitizer:
         def vacant(start: int, end: int) -> bool:
             return all(end <= s or start >= e for s, e, _ in claimed)
 
+        # Порядок: от БОЛЕЕ КОНТЕКСТНОГО к менее. Телефон и паспорт опознаются по
+        # якорю («+7», «8», формат 4+6), то есть несут больше свидетельств, чем
+        # голая цифровая последовательность. Обратный порядок ломался так:
+        # у «+7 916 123-45-67» внутренние 10 цифр проходят контрольную сумму ИНН,
+        # распознаватель идентификаторов забирал участок первым, и телефон уезжал
+        # через gen_inn10 - расходясь с заменой того же номера в колонке.
+        # Случай «номер с якорем телефона, но целиком валидный идентификатор»
+        # разбирается внутри _phone: контрольная сумма ВСЕЙ строки сильнее якоря.
         for pattern, handler in (
-            (_ID_TOKEN_RE, self._checksummed),
             (_EMAIL_RE, lambda m: self.mapper.email(m.group())),
-            (_PHONE_RE, lambda m: self.mapper.phone(m.group())),
-            (_PASSPORT_RE, lambda m: gen_digits_like(self.salt, m.group())),
+            (_PHONE_RE, self._phone),
+            (_PASSPORT_RE, self._passport),
+            (_ID_TOKEN_RE, self._checksummed),
             (_FIO_INITIALS_RE, self._fio_initials),
             (_CAP_PAIR_RE, lambda m: self._cap_pair(m, notes, aggressive)),
         ):
@@ -137,6 +145,22 @@ class TextSanitizer:
     #   OUTPUTS: { str - замена или исходник }
     #   SIDE_EFFECTS: none
     # END_CONTRACT: _checksummed
+    def _phone(self, m: re.Match) -> str:
+        """Телефон. Разметка формы («+», скобки, дефисы) побеждает контрольную
+        сумму: СТРУКТУРНАЯ колонка про суммы не знает и всегда идёт через
+        mapper.phone, а расхождение колонки и текста - нарушение §3.2.
+        У ГОЛОЙ последовательности цифр разметки нет, и единственное доступное
+        свидетельство - контрольная сумма; там она и решает."""
+        raw = m.group()
+        if raw.strip(" 0123456789"):          # есть «+», скобка или дефис
+            return self.mapper.phone(raw)
+        by_checksum = self._checksummed(m)
+        return by_checksum if by_checksum is not None else self.mapper.phone(raw)
+
+    def _passport(self, m: re.Match) -> str:
+        """Формат «4 цифры пробел 6» - разметка паспорта; тот же довод."""
+        return gen_digits_like(self.salt, m.group())
+
     def _checksummed(self, m: re.Match) -> str | None:
         raw = m.group()
         d = normalize_digits(raw)
@@ -207,7 +231,11 @@ class TextSanitizer:
             return self.llm_cache[key]
         if self.llm is None:
             return None
-        verdict = bool(self.llm(fragment))
+        verdict = self.llm(fragment)
+        if verdict is None:
+            return None          # модель не ответила внятно - это «не знаю»,
+                                 # а не «не персональные данные»; в кэш не кладём
+        verdict = bool(verdict)
         self.llm_cache[key] = verdict
         return verdict
 
@@ -269,8 +297,14 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
             length_policy[qualified] = pc.length_policy
 
     limits = max_len or {}
-    notes_rows: list[tuple] = []
-    summary: dict = {}
+    # Накопленное состояние прохода 2 живёт рядом с дампом. Без него возобновление
+    # обнуляло отчёт: пропущенная таблица получала {rows:0, degraded:0}, а
+    # sanitization.sql перезаписывался целиком - и проверка деградаций, ради
+    # которой всё делалось, после возобновления гарантированно молчала.
+    state_path = dump_dir / "sanitization-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))         if (resume and state_path.exists()) else {"notes": [], "summary": {}}
+    notes_rows: list[tuple] = [tuple(n) for n in state["notes"]]
+    summary: dict = dict(state["summary"])
     # Возобновляемость (§5.7) была объявлена и не реализована: журнал писался, но
     # не читался, и повторный вызов обрабатывал таблицу ВТОРОЙ раз - фейковый
     # телефон снова попадал под шаблон и заменялся на другой фейк.
@@ -278,9 +312,8 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
     for dumpid, table in toc_tables(dump_dir, pg_restore).items():
         if table not in free_cols:
             continue
-        if table in already_done:
-            summary[table] = {"rows": 0, "degraded": 0, "skipped": "already done"}
-            continue
+        if table in already_done and table in summary:
+            continue          # итоги прошлой попытки уже в накопленном состоянии
         if runlog:
             runlog.mark("pass2", table, "running")
         order = columns_order[table]
@@ -340,6 +373,9 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
         if runlog:
             runlog.mark("pass2", table, "done")
 
+    state_path.write_text(json.dumps({"notes": [list(n) for n in notes_rows],
+                                      "summary": summary}, ensure_ascii=False),
+                          encoding="utf-8")
     _write_sanitization_sql(dump_dir, notes_rows, summary)
     return summary
 

@@ -18,7 +18,9 @@
 #   classifier_ask - роль 1: метаданные колонок -> семантические типы
 #   corpus_generate - роль 2: порождение компонент корпуса
 #   direct_map - роль 3: карта 1:1 для не-ПДн значений
-#   ner_verdict - роль 4: «это персональные данные?» по фрагменту текста
+#   ner_verdict - роль 4: да | нет | не знаю по фрагменту текста
+#   NER_ACCEPTANCE - набор фрагментов с известными ответами для приёмки
+#   ner_acceptance - приёмка модели на роль 4 перед прогоном
 # END_MODULE_MAP
 from __future__ import annotations
 
@@ -319,12 +321,45 @@ def direct_map(client: LLMClient, values: list[str]) -> dict[str, str]:
 #   OUTPUTS: { bool - являются ли персональными данными }
 #   SIDE_EFFECTS: сетевой вызов
 # END_CONTRACT: ner_verdict
-def ner_verdict(client: LLMClient, fragment: str) -> bool:
+def ner_verdict(client: LLMClient, fragment: str) -> bool | None:
+    """True - персональные данные, False - нет, None - модель не ответила внятно.
+
+    None критично: вызывающий трактует его как «не знаю» и записывает деградацию.
+    Прежняя версия возвращала False на любой неразобранный ответ - и модель,
+    отвечающая не тем словом, молча снимала защиту: фрагмент оставался в копии
+    БЕЗ отметки, то есть хуже, чем при полностью отключённой модели."""
     client.require_local("ner_verdict")
     raw = client.chat(
         f"Фрагмент: «{fragment}»\nЭто имя человека (ФИО, обращение к человеку)? "
         f"Ответь одним словом: да или нет.",
-        "Ты определяешь, содержит ли фрагмент имя человека. Одно слово.",
+        "Ты определяешь, содержит ли фрагмент имя человека. Одно слово: да или нет.",
         role="ner")
     answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip().lower()
-    return answer.startswith(("да", "yes", "true"))
+    if answer.startswith(("да", "yes", "true")):
+        return True
+    if answer.startswith(("нет", "no", "false")):
+        return False
+    return None
+
+
+# Приёмка модели перед прогоном: роль 4 - защитный механизм, и негодная модель
+# понижает защиту молча. Замерено: mistral-nemo:12b отвечает «нет» на «Мария
+# Сидорова», то есть оставляет ФИО в копии.
+NER_ACCEPTANCE = (
+    ("Иванов Пётр Сергеевич", True), ("Мария Сидорова", True),
+    ("Согласовал Иванова", True), ("Петрова А.И.", True),
+    ("Заявку принял Аглая Востросаблина", True),
+    ("Плановое обслуживание станка", False), ("Отгрузка вагонов", False),
+    ("Ремонт кровли цеха", False), ("Инвентаризация склада", False),
+    ("Замена подшипника насоса", False),
+)
+
+
+def ner_acceptance(client: LLMClient, threshold: float = 0.8) -> tuple[bool, str]:
+    """Проверка пригодности модели на роль 4. Возвращает (годна, отчёт)."""
+    hits = [(fragment, expected, ner_verdict(client, fragment))
+            for fragment, expected in NER_ACCEPTANCE]
+    ok = sum(1 for _, e, got in hits if got is e)
+    wrong = [f for f, e, got in hits if got is not e]
+    return (ok / len(hits) >= threshold,
+            f"{ok}/{len(hits)}" + (f"; ошибки: {wrong[:3]}" if wrong else ""))

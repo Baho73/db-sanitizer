@@ -255,11 +255,22 @@ def _direct_llm(client):
 
 def _ner_llm(client):
     """Роль 4: вердикт по спорному фрагменту. Только модель в контуре - иначе
-    инструмент обезличивания сам отправит персональные данные наружу."""
+    инструмент обезличивания сам отправит персональные данные наружу.
+
+    Перед прогоном модель проходит приёмку: роль 4 - защитный механизм, и
+    негодная модель понижает защиту МОЛЧА. Замерено: mistral-nemo:12b отвечает
+    «нет» на «Мария Сидорова», то есть оставляет ФИО в копии без отметки."""
     from sanitizer import llm as llm_mod
 
     if client is None or not client.sees_personal_data:
         return None
+    ok, report = llm_mod.ner_acceptance(client)
+    if not ok:
+        print(f"МОДЕЛЬ {client.model} НЕ ПРИНЯТА на роль NER: {report}")
+        print("Свободный текст обрабатывается без неё; неразобранные фрагменты "
+              "получат отметку low_confidence_ner и попадут в порог max_degraded.")
+        return None
+    print(f"приёмка модели на роль NER: {report}")
     return lambda fragment: llm_mod.ner_verdict(client, fragment)
 
 
