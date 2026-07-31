@@ -1,0 +1,137 @@
+<GraceChangePlan graceVersion="4.0" status="applied">
+  <C-REVIEW2-FIXES>
+    <IntentSummary>Порядок - по вреду, как в прошлый раз. Сначала три major класса «консистентность/полнота рвётся молча на стыке слоёв»: возобновление прохода 2, toc_tables, паспорт. Затем обходы fail-closed: валидация плана, гейт публикации, привязка approve, вакуум fake(x)≠x. Затем согласованность заявленного и реализованного: NULL в shuffle, версия соли. Последними - minor в llm.py и синхронизация документов с durable-состоянием. Реализация параллелится по модулям, чтобы не было конфликтов записи: postproc; cli+plan_graph+runlog; verifier; policy+executor+mapper+cmd_transformer; llm.</IntentSummary>
+    <BaselineAssertions>
+      <MustExist>
+        <Value>docs/code-review-2-2026-07-31.md</Value>
+        <Value>sanitizer/postproc.py</Value>
+        <Value>sanitizer/verifier.py</Value>
+        <Value>sanitizer/cli.py</Value>
+        <Value>sanitizer/plan_graph.py</Value>
+        <Value>.grace/changes/archive/C-EXTERNAL-REVIEW/spec.xml</Value>
+      </MustExist>
+    </BaselineAssertions>
+    <TargetAssertions>
+      <MustVerify>
+        <Module>M-POSTPROC</Module>
+        <Module>M-CLI</Module>
+        <Module>M-PLAN-GRAPH</Module>
+        <Module>M-RUNLOG</Module>
+        <Module>M-VERIFIER</Module>
+        <Module>M-POLICY</Module>
+        <Module>M-EXECUTOR</Module>
+        <Module>M-MAPPER</Module>
+        <Module>M-LLM</Module>
+      </MustVerify>
+      <MustPassCommand>
+        <Command>python -m pytest tests/unit -q</Command>
+      </MustPassCommand>
+    </TargetAssertions>
+    <DurableScope>
+      <VerificationAnchors>
+        <V-M-POSTPROC />
+        <V-M-CLI />
+        <V-M-PLAN-GRAPH />
+        <V-M-RUNLOG />
+        <V-M-VERIFIER />
+        <V-M-POLICY />
+        <V-M-EXECUTOR />
+        <V-M-MAPPER />
+        <V-M-LLM />
+      </VerificationAnchors>
+    </DurableScope>
+    <ObservedWriteScope>
+      <Glob>sanitizer/**</Glob>
+      <Glob>tests/**</Glob>
+      <Glob>docs/**</Glob>
+      <Glob>.grace/**</Glob>
+      <File>README.md</File>
+      <File>pyproject.toml</File>
+      <File>docker/Dockerfile</File>
+      <File>docker/docker-compose.yml</File>
+    </ObservedWriteScope>
+    <ImplementationPlan>
+      <T-001>
+        <Title>Н1: возобновление прохода 2 в реальном крахе</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>sanitization-state.json пишется атомарно после каждой таблицы, а не в конце.</Criterion>
+          <Criterion>cmd_run возобобновляет существующий run_id при совпадении отпечатков плана и соли; при расхождении - отказ.</Criterion>
+          <Criterion>Тест имитирует крах (mark done без state, новый процесс/run_id) - значения не меняются.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_review2_postproc.py tests/unit/test_review2_cli.py -q</Command>
+        </Verification>
+      </T-001>
+      <T-002>
+        <Title>Н2: toc_tables и покрытие freetext-таблиц</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Квотированные идентификаторы (пробелы, точки, раздвоенные кавычки) разбираются корректно.</Criterion>
+          <Criterion>Нераспознанная строка TABLE DATA - отказ; freetext-таблица плана вне TOC - отказ с перечислением.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_review2_postproc.py -q</Command>
+        </Verification>
+      </T-002>
+      <T-003>
+        <Title>Н3: паспорт - один идентификатор, одна замена</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Пара passport_series+passport_number заменяется единым ключом 10 цифр (одна FPE-10, разбиение 4+6), согласованно с текстовым слоем и doc_number.</Criterion>
+          <Criterion>_PASSPORT_RE покрывает дефис, множественные пробелы, форму «серия ... номер ...»; замена сохраняет разделители исходника.</Criterion>
+          <Criterion>Паспорт входит в leak-check верификатора; property-тест «три представления → одна замена».</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_review2_passport.py -q</Command>
+        </Verification>
+      </T-003>
+      <T-004>
+        <Title>Обходы fail-closed: валидация, гейт публикации, approve</Title>
+        <DependsOn>T-001</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Проверка покрытия колонок выполняется безусловно, не только при fingerprint-mismatch.</Criterion>
+          <Criterion>publishable требует pass1/pass2/verify done и согласованность метаданных verify со строками прогона.</Criterion>
+          <Criterion>approve сверяет хэш черновика с показанным; plan поверх висящего гейта - отказ; checkpoint-файл с правами 0600.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit -q</Command>
+        </Verification>
+      </T-004>
+      <T-005>
+        <Title>Слепые зоны верификатора</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>fake(x)≠x работает для таблиц с трансформируемой PK-колонкой (мультимножества значений дизъюнктны).</Criterion>
+          <Criterion>_FK_COUNT сравнивает pg_namespace.nspname; leak-check сканирует числовые колонки; таблица без PK - красная проверка, не исключение.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_review2_verifier.py -q</Command>
+        </Verification>
+      </T-005>
+      <T-006>
+        <Title>Согласованность заявленного: NULL в shuffle, версия соли, мелочи исполнения</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>_shuffle_map фильтрует NULL; доля NULL до/после совпадает.</Criterion>
+          <Criterion>Версия мастер-соли входит в производную соль; исключения не несут исходных значений.</Criterion>
+          <Criterion>llm.py: direct_map терпим к массиву, уверенность клампится в [0,1], роль 3 уважает llm_mode плана.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit -q</Command>
+        </Verification>
+      </T-006>
+      <T-007>
+        <Title>Документы, durable-состояние, инфраструктура</Title>
+        <DependsOn>T-006</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>README: команда approve, актуальное число тестов; docker-compose без устаревшего комментария; pyproject с langgraph-checkpoint-sqlite; Dockerfile с пинами клиента.</Criterion>
+          <Criterion>.grace/verification отражает новые тесты; module-status синхронизирован; бандл переведён в archive со status=applied; grace lint без ошибок.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests -q; grace lint --path .</Command>
+        </Verification>
+      </T-007>
+    </ImplementationPlan>
+  </C-REVIEW2-FIXES>
+</GraceChangePlan>
