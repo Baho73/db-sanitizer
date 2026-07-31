@@ -1,0 +1,123 @@
+<GraceChangePlan graceVersion="4.0" status="applied">
+  <C-EXTERNAL-REVIEW>
+    <IntentSummary>Порядок продиктован вредом, а не удобством. Сначала блокер: он ломает главное свойство системы и не ловится ни одной проверкой. Затем группа fail-open на исполнении - механизмы, надёжные при планировании и дырявые при прогоне. Затем три свойства, объявленные документом и не работавшие: их отсутствие обесценивало выбор LangGraph и обещание масштаба. Последней - языковая модель: она наибольшая по объёму, но остальное без неё работает, а она без остального нет.</IntentSummary>
+    <BaselineAssertions>
+      <MustExist>
+        <Value>docs/code-review-2026-07-31.md</Value>
+        <Value>sanitizer/postproc.py</Value>
+        <Value>sanitizer/plan_graph.py</Value>
+        <Value>.grace/changes/archive/C-REVIEW4-HARDENING/spec.xml</Value>
+      </MustExist>
+    </BaselineAssertions>
+    <TargetAssertions>
+      <MustVerify>
+        <Module>M-LLM</Module>
+        <Module>M-POSTPROC</Module>
+        <Module>M-POLICY</Module>
+        <Module>M-PLAN-GRAPH</Module>
+        <Module>M-EXECUTOR</Module>
+        <Module>M-PROFILER</Module>
+        <Module>M-VERIFIER</Module>
+        <Module>M-MAPPER</Module>
+        <Module>M-CLASSIFIER</Module>
+        <Module>M-CLI</Module>
+      </MustVerify>
+      <MustPassCommand>
+        <Command>python -m pytest tests/unit -q</Command>
+      </MustPassCommand>
+    </TargetAssertions>
+    <DurableScope>
+      <VerificationAnchors>
+        <V-M-LLM />
+        <V-M-POSTPROC />
+        <V-M-POLICY />
+        <V-M-PLAN-GRAPH />
+        <V-M-EXECUTOR />
+        <V-M-PROFILER />
+        <V-M-VERIFIER />
+        <V-M-MAPPER />
+        <V-M-CLASSIFIER />
+        <V-M-CORPUS />
+        <V-M-RUNLOG />
+        <V-M-CLI />
+      </VerificationAnchors>
+    </DurableScope>
+    <ObservedWriteScope>
+      <Glob>sanitizer/**</Glob>
+      <Glob>tests/**</Glob>
+      <Glob>docs/**</Glob>
+      <Glob>.grace/**</Glob>
+      <File>README.md</File>
+      <File>Makefile</File>
+      <File>docker/Dockerfile</File>
+      <File>docker/docker-compose.yml</File>
+    </ObservedWriteScope>
+    <ImplementationPlan>
+      <T-001>
+        <Title>Блокер: один проход вместо последовательных подстановок</Title>
+        <DependsOn></DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Совпадения ищутся по исходному тексту, замены накладываются один раз, занятый участок повторно не рассматривается.</Criterion>
+          <Criterion>Порядок обработчиков: сначала решаемое контрольной суммой, затем форматные эвристики.</Criterion>
+          <Criterion>Разделители исходника сохраняются; СНИЛС в трёх написаниях даёт одно значение, совпадающее с колонкой.</Criterion>
+          <Criterion>Страховочный слой добирает телефон без «+», СНИЛС через пробелы, кириллические домены, номера карт по алгоритму Луна; число без валидной контрольной суммы не трогается.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_code_review_fixes.py -q</Command>
+        </Verification>
+      </T-001>
+      <T-002>
+        <Title>Fail-open на исполнении</Title>
+        <DependsOn>T-001</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>run проверяет план и отпечаток схемы против свежего снимка перед прогоном.</Criterion>
+          <Criterion>Белые списки значений: стратегия, llm_mode, семантический тип, разметка jsonb, политика длины.</Criterion>
+          <Criterion>Неизвестная стратегия и нереализованное обобщение роняют прогон, а не оставляют значение как есть.</Criterion>
+          <Criterion>Email не понижается в fake; целое с ведущим нулём - явный отказ; составной ключ в freetext-таблице - отказ вместо первой колонки.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit -q</Command>
+        </Verification>
+      </T-002>
+      <T-003>
+        <Title>Три свойства, объявленные и не работавшие</Title>
+        <DependsOn>T-002</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Чекпойнтер на SQLite, подкоманда approve, снимок схемы восстанавливается из состояния графа.</Criterion>
+          <Criterion>Проход 2 потоковый, с временным файлом и атомарной заменой; журнал читается, обработанная таблица не обрабатывается повторно.</Criterion>
+          <Criterion>Идентификаторы SQL квотируются везде; схема сравнивается по pg_namespace.nspname; ключ строки склеивается управляющим символом.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/integration/test_gate_and_resume.py -q</Command>
+        </Verification>
+      </T-003>
+      <T-004>
+        <Title>Языковая модель во всех четырёх ролях</Title>
+        <DependsOn>T-003</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>Модуль M-LLM: два поставщика за одним интерфейсом, выбор окружением, отсутствие поставщика не ошибка.</Criterion>
+          <Criterion>Роль 4 допускает только поставщика в контуре; внешний получает отказ исключением.</Criterion>
+          <Criterion>Разбор ответа терпим к форме, но позиционный массив без имён колонок отвергается.</Criterion>
+          <Criterion>Ответ модели фильтруется: карта 1:1 достраивается генератором, корпуса проходят валидатор, тип вне словаря становится «не знаю».</Criterion>
+          <Criterion>Замер на живой модели: деградации прохода 2 88 -&gt; 0; точность второго голоса на путающих случаях не ниже 5 из 7 без уверенных ошибок.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests/unit/test_llm.py -q; LLM_PROVIDER=ollama python -m pytest tests/integration/test_llm_live.py -q</Command>
+        </Verification>
+      </T-004>
+      <T-005>
+        <Title>Согласовать durable-состояние и документы</Title>
+        <DependsOn>T-004</DependsOn>
+        <AcceptanceCriteria>
+          <Criterion>M-LLM в графе и индексах; свидетельства отражают фактические числа тестов и фактические команды.</Criterion>
+          <Criterion>Отклонение D-LLM-ABSENT помечено закрытым; deployment.xml не заявляет Ollama в compose.</Criterion>
+          <Criterion>Документы (README, solution-design §4.2/§4.4, module-status) описывают работающие роли и замеры, а не намерения.</Criterion>
+          <Criterion>grace lint без ошибок.</Criterion>
+        </AcceptanceCriteria>
+        <Verification>
+          <Command>python -m pytest tests -q; grace lint --path .</Command>
+        </Verification>
+      </T-005>
+    </ImplementationPlan>
+  </C-EXTERNAL-REVIEW>
+</GraceChangePlan>
