@@ -2,7 +2,7 @@
 COMPOSE = docker compose -f docker/docker-compose.yml
 TOOL = $(COMPOSE) run --rm tool
 
-.PHONY: up build seed plan run restore verify demo demo-dump test clean
+.PHONY: up build seed plan run restore verify publish demo demo-dump test clean
 
 up:
 	$(COMPOSE) up -d demo-db staging-db
@@ -27,8 +27,12 @@ verify:
 	  --src-dsn postgresql://demo:demo@demo-db:5432/demo \
 	  --dst-dsn postgresql://staging:staging@staging-db:5432/staging
 
-# полный цикл: посев -> план с гейтом -> два прохода -> restore -> верификация
-demo: build seed plan run restore verify
+# публикация - единственный путь дампа из рабочего каталога; без verify откажет
+publish:
+	$(TOOL) python -m sanitizer.cli publish --to out/published
+
+# полный цикл: посев -> план с гейтом -> два прохода -> restore -> верификация -> публикация
+demo: build seed plan run restore verify publish
 	@echo "=== ДЕМО ЗАВЕРШЕНО: отчёт в out/verify-report.md ==="
 
 # вход «дамп» из ТЗ: pg_dump демо-базы -> разворачивание во временную БД -> тот же конвейер

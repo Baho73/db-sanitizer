@@ -72,5 +72,6 @@ class RunLog:
         return "verify" in {stage for stage, *_ in rows}
 
     def entries(self, run_id: str) -> list[tuple]:
+        # порядок по rowid, как в publishable: часы контейнеров ненадёжны
         return self.db.execute("SELECT stage, tbl, status, checksum FROM run_log "
-                               "WHERE run_id=? ORDER BY ts", (run_id,)).fetchall()
+                               "WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall()

@@ -37,7 +37,8 @@ def classified():
 
 def test_assign_strategies():
     plan = assign(classified(), make_snap(), sensitive_categories={"hr.e.grade"},
-                  json_map={"hr.e.attrs": {"phone": "phone", "emergency": "fio_full"}})
+                  json_map={"hr.e.attrs": {"phone": "phone", "emergency": "fio_full"}},
+                  llm_available=True)
     c = plan.columns
     assert c["hr.e.last_name"].strategy == "fake" and c["hr.e.last_name"].llm_mode == "corpus"
     assert c["hr.e.inn"].strategy == "generate"
@@ -73,13 +74,22 @@ def test_jsonb_without_map_is_unresolved():
 
 def test_fake_low_cardinality_blocked():
     snap = make_snap()
-    plan = assign(classified(), snap)
+    plan = assign(classified(), snap, llm_available=True)
+
+    def grade_errors():
+        return [e for e in validate_plan(plan, snap)
+                if e.startswith("hr.e.grade") and "frequency attack" in e]
+
     # категориальный тип с публично известным распределением - fake запрещён (§5.6)
     plan.columns["hr.e.grade"] = PlanColumn("category", "fake", "corpus", "forced")
-    assert any("frequency attack" in e for e in validate_plan(plan, snap))
+    assert grade_errors()
     # для компонент ФИО той же кардинальности риск принят (§6.2) - не ошибка
     plan.columns["hr.e.grade"] = PlanColumn("family", "fake", "corpus", "forced")
-    assert not any("frequency attack" in e for e in validate_plan(plan, snap))
+    assert not grade_errors()
+    # запрет снимается подтверждением на гейте, а не молча
+    plan.columns["hr.e.grade"] = PlanColumn("category", "fake", "corpus", "forced",
+                                            confirmed=True, confirmed_by="human")
+    assert not grade_errors()
 
 
 def test_schema_drift_detected():
@@ -97,6 +107,12 @@ def test_dump_load_diff(tmp_path):
     plan.dump(p)
     loaded = Plan.load(p)
     assert loaded.columns.keys() == plan.columns.keys()
-    loaded.columns["hr.e.org"].strategy = "fake"
+    loaded.columns["hr.e.org"].strategy = "keep"
     d = plan_diff(plan, loaded)
     assert d == {"hr.e.org": "changed"}
+    # поля аудита решением не являются: подтверждение ставится после черновика,
+    # и сравнение по нему давало бы «changed» на каждом прогоне
+    loaded.columns["hr.e.org"].strategy = plan.columns["hr.e.org"].strategy
+    loaded.columns["hr.e.org"].confirmed = True
+    loaded.columns["hr.e.org"].confirmed_by = "human"
+    assert plan_diff(plan, loaded) == {}

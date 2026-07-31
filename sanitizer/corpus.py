@@ -12,6 +12,8 @@
 #   load_components - чтение компонент корпуса из JSON (fixtures или кэш LLM)
 #   build_corpora - компоненты -> словарь корпусов для Mapper
 #   validate_corpus - формат/КС/дубли/длина; список нарушений
+#   SEM_TO_CORPUS - семантический тип -> корпуса-источники замен
+#   corpus_limits - предел длины на корпус по колонкам-потребителям
 #   llm_components - генерация компонент через LLM-callable с кэшем на диске
 # END_MODULE_MAP
 from __future__ import annotations
@@ -94,6 +96,42 @@ def validate_corpus(corpora: dict[str, list[str]], max_len: dict[str, int] | Non
 
 
 
+
+
+# Семантический тип -> корпуса, из которых берётся замена. Нужен, чтобы предел
+# длины колонки-потребителя доехал до валидатора: без этой связи проверка длины
+# в validate_corpus не срабатывала никогда (разбор 4, находка 13).
+SEM_TO_CORPUS: dict[str, tuple[str, ...]] = {
+    "family": ("family",),
+    "name": ("name_m", "name_f"),
+    "patronymic": ("patronymic_m", "patronymic_f"),
+    "fio_full": ("family", "name_m", "name_f", "patronymic_m", "patronymic_f"),
+    "city": ("city",),
+    "region": ("region",),
+    "address": ("region", "city", "street"),
+    "org_name": ("org",),
+}
+
+
+# START_CONTRACT: corpus_limits
+#   PURPOSE: Предел длины на корпус - минимум по длинам колонок, которые из него
+#            наполняются. Замена длиннее колонки падает на restore, то есть уже
+#            после того, как верификация показала «зелено».
+#   INPUTS: { sem_by_column: колонка -> sem_type (только стратегия fake),
+#             max_len_by_column: колонка -> длина или None }
+#   OUTPUTS: { dict корпус -> предел длины }
+#   SIDE_EFFECTS: none
+# END_CONTRACT: corpus_limits
+def corpus_limits(sem_by_column: dict[str, str],
+                  max_len_by_column: dict[str, int | None]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for column, sem in sem_by_column.items():
+        limit = max_len_by_column.get(column)
+        if not limit:
+            continue
+        for key in SEM_TO_CORPUS.get(sem, ()):
+            out[key] = min(out.get(key, limit), limit)
+    return out
 
 
 def llm_components(cache_path: Path, generate: Callable[[str], list[str]] | None = None) -> dict[str, list[str]]:

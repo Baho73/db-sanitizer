@@ -90,6 +90,7 @@ def test_verify_defaults_point_to_both_bases():
 
 
 def test_salt_from_environment(monkeypatch):
+    monkeypatch.setenv("MASTER_SALT", "test-master")   # умолчания у соли нет намеренно
     monkeypatch.setenv("RECIPIENT", "contractor-x")
     monkeypatch.setenv("GENERATION", "g7")
     monkeypatch.setenv("MASTER_SALT_VERSION", "3")

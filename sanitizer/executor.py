@@ -8,6 +8,7 @@
 # END_MODULE_CONTRACT
 #
 # START_MODULE_MAP
+#   salt_fingerprint - необратимый отпечаток производной соли для сверки проходов
 #   prepare_artifacts - direct-карты (LLM или corpus-fallback) + shuffle-карты
 #   greenmask_config - план -> config.yml (классы только через Cmd)
 #   run_pass1 - dump с журналированием
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import yaml
 
-from sanitizer.mapper import Mapper, Salt, _h
+from sanitizer.mapper import Mapper, Salt, _h, salt_fingerprint
 from sanitizer.policy import Plan
 from sanitizer.runlog import RunLog
 
@@ -41,6 +42,10 @@ def prepare_artifacts(plan: Plan, dsn: str, salt: Salt, corpora: dict[str, list[
     import psycopg
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Проход 1 исполняется в дочернем процессе Greenmask, который читает соль из
+    # окружения заново. Ничто не утверждало, что это ТА ЖЕ соль: расхождение дало бы
+    # две несогласованные замены одного значения молча. Отпечаток закрывает связь.
+    (out_dir / "salt.fingerprint").write_text(salt_fingerprint(salt), encoding="utf-8")
     mapper = Mapper(salt, corpora)
     written: list[Path] = []
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:

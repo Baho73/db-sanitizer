@@ -7,6 +7,11 @@ services:
       demo-db: {condition: service_healthy}
       staging-db: {condition: service_healthy}
     volumes: ["../out:/app/out"]
+    environment:
+      # соль демо-прогона; у инструмента нет умолчания намеренно
+      MASTER_SALT: ${MASTER_SALT:-dev-master}
+      RECIPIENT: ${RECIPIENT:-dev}
+      GENERATION: ${GENERATION:-g1}
     profiles: ["tool"]
 
   demo-db:
@@ -33,10 +38,6 @@ services:
       interval: 3s
       retries: 20
 
-  ollama:
-    image: ollama/ollama:latest
-    ports: ["21434:11434"]
-    volumes: ["ollama-models:/root/.ollama"]
-
-volumes:
-  ollama-models: {}
+# Сервис ollama убран: поставщика LLM в конвейере нет (см. docs/solution-design.md
+# §4.2, «отклонение: LLM»). Держать поднятый контейнер, к которому никто не
+# обращается, значит обещать механизм, которого не существует.

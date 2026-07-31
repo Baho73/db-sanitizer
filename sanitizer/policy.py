@@ -40,7 +40,7 @@ ADDR_PARSE_THRESHOLD = 0.9
 class PlanColumn:
     sem_type: str
     strategy: str            # direct|fake|generate|generalize|shuffle|keep|null|freetext|jsonb|unresolved
-    llm_mode: str            # direct|corpus|none
+    llm_mode: str            # direct|corpus|none - КТО произвёл материал замены
     reason: str
     confirmed: bool = False  # обязателен для null/generalize; проставляется ТОЛЬКО на гейте
     confirmed_by: str = ""   # human|ci - кто подтвердил; пусто = не подтверждено
@@ -117,7 +117,8 @@ _STRATEGY: dict[SemType, tuple[str, str]] = {  # sem_type -> (strategy, llm_mode
 # END_CONTRACT: assign
 def assign(classified: list[ClassifiedColumn], snap: Snapshot,
            sensitive_categories: set[str] = frozenset(),
-           json_map: dict[str, dict[str, str]] | None = None) -> Plan:
+           json_map: dict[str, dict[str, str]] | None = None,
+           llm_available: bool = False) -> Plan:
     cols: dict[str, PlanColumn] = {}
     for cc in classified:
         info = snap.col(cc.column)
@@ -152,6 +153,12 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
             pass  # ПДн малой кардинальности: fake запрещён - валидация потребует решения
         if strategy == "direct" and (st in PII_TYPES or info.cardinality > DIRECT_THRESHOLD):
             strategy, mode, reason = "fake", "corpus", "direct-forbidden"      # §3.1
+        # Стратегия direct - это МАТЕРИАЛИЗОВАННАЯ карта 1:1 (инъективная по
+        # построению). Кто её произвёл, говорит llm_mode: "direct" - модель,
+        # "none" - детерминированный генератор из корпуса. Поставщика LLM в проекте
+        # нет, поэтому режим понижается явно, а не подменяется молча (находка 11).
+        if strategy == "direct" and not llm_available:
+            mode, reason = "none", "карта 1:1 из корпуса (LLM не настроена)"
         if strategy == "generate" and st == SemType.EMAIL and not info.is_unique:
             strategy, mode = "fake", "corpus"
         # Колонка-ключ с персональными данными (PRIMARY KEY (snils), UNIQUE (email)):
@@ -176,7 +183,7 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
                     cols[c].strategy = s
     return Plan(1, schema_fingerprint(snap), cols, classes, [],
                 {"direct_threshold": DIRECT_THRESHOLD, "fake_min_cardinality": FAKE_MIN_CARD,
-                 "addr_parse_threshold": ADDR_PARSE_THRESHOLD})
+                 "addr_parse_threshold": ADDR_PARSE_THRESHOLD, "llm_available": llm_available})
 
 
 
@@ -202,6 +209,8 @@ def validate_plan(plan: Plan, snap: Snapshot) -> list[str]:
             errors.append(f"{name}: unresolved ({pc.reason})")
         if pc.strategy == "direct" and pc.sem_type in pii_str:
             errors.append(f"{name}: PII type {pc.sem_type} in direct mode is forbidden")
+        if pc.llm_mode == "direct" and not plan.params.get("llm_available", False):
+            errors.append(f"{name}: llm_mode direct без настроенной LLM - механизма замены нет")
         if pc.strategy in ("null", "generalize") and not (pc.confirmed and pc.confirmed_by):
             errors.append(f"{name}: strategy {pc.strategy} requires human confirmation")
         info = by_name.get(name)
@@ -211,12 +220,17 @@ def validate_plan(plan: Plan, snap: Snapshot) -> list[str]:
                           f"замена неинъективна, UNIQUE не удержится")
         if pc.strategy == "fake":
             # частотная атака (§5.6) актуальна для типов с ПУБЛИЧНО известным
-            # распределением; для компонент ФИО риск принят явно (§6.2)
+            # распределением; для компонент ФИО риск принят явно (§6.2).
+            # Запрет снимается подтверждением на гейте, а не молча: без LLM у
+            # названий организаций иначе не остаётся ни одной допустимой стратегии
+            # (direct невозможен, fake запрещён) - и инструмент вставал бы намертво.
             if pc.sem_type in ("category", "city", "region", "org_name", "kpp"):
                 if info is None:
                     errors.append(f"{name}: column vanished from schema")
-                elif info.cardinality < plan.params.get("fake_min_cardinality", FAKE_MIN_CARD):
-                    errors.append(f"{name}: fake at cardinality {info.cardinality} < min - frequency attack (§5.6)")
+                elif info.cardinality < plan.params.get("fake_min_cardinality", FAKE_MIN_CARD) \
+                        and not (pc.confirmed and pc.confirmed_by):
+                    errors.append(f"{name}: fake at cardinality {info.cardinality} < min - "
+                                  f"frequency attack (§5.6); нужно подтверждение на гейте")
     for cls in plan.classes:
         strategies = {plan.columns[c].strategy for c in cls if c in plan.columns}
         if len(strategies - {"keep"}) > 1:

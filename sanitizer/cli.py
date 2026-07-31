@@ -14,6 +14,7 @@
 #   cmd_run - исполнение: проход 1 и проход 2
 #   cmd_restore - разворачивание дампа в staging вместе со схемой sanitization
 #   cmd_verify - верификация и блокировка публикации
+#   cmd_publish - вынос дампа из рабочего каталога только при разрешении журнала
 #   cmd_report - сборка страницы стенда «до/после»
 # END_MODULE_MAP
 from __future__ import annotations
@@ -25,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from sanitizer.corpus import build_corpora, load_components
+from sanitizer.corpus import build_corpora, corpus_limits, load_components, validate_corpus
 from sanitizer.mapper import Salt
 from sanitizer.policy import Plan
 from sanitizer.runlog import RunLog
@@ -34,8 +35,17 @@ DEF_COMPONENTS = "sanitizer/data/components-ru.json"
 
 
 def _salt() -> Salt:
-    # os.environb только на POSIX - на Windows CLI падал бы при старте
-    return Salt(master=os.environ.get("MASTER_SALT", "dev-master").encode(),
+    # os.environb только на POSIX - на Windows CLI падал бы при старте.
+    # Умолчания у MASTER_SALT нет: соль - единственный секрет системы, и молчаливый
+    # публично известный дефолт означал бы обратимое обезличивание без единого
+    # предупреждения (разбор 4, таблица свойств: детерминизм).
+    master = os.environ.get("MASTER_SALT")
+    if not master:
+        raise SystemExit(
+            "MASTER_SALT не задан. Соль - единственный секрет инструмента: без неё "
+            "замены воспроизводит кто угодно.\nДальше: экспортируйте MASTER_SALT "
+            "(для демо достаточно MASTER_SALT=dev-master), затем повторите команду.")
+    return Salt(master=master.encode(),
                 recipient=os.environ.get("RECIPIENT", "dev"),
                 generation=os.environ.get("GENERATION", "g1"),
                 version=int(os.environ.get("MASTER_SALT_VERSION", "1")))
@@ -53,7 +63,8 @@ def cmd_plan(a) -> int:
     from sanitizer.plan_graph import build_graph, run_planning
 
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
-    state = {"dsn": a.dsn, "schema": "hr", "llm_cache": a.llm_cache,
+    state = {"dsn": a.dsn, "schema": a.schema, "llm_cache": a.llm_cache,
+             "llm_available": bool(cfg.get("llm_available")),
              "json_map": cfg.get("json_map", {}),
              "sensitive_categories": cfg.get("sensitive_categories", []),
              "overrides": cfg.get("overrides", {}),
@@ -94,17 +105,31 @@ def cmd_run(a) -> int:
     corpora = build_corpora(load_components(Path(a.components)))
     work = Path(a.work)
     work.mkdir(parents=True, exist_ok=True)
+
+    # снапшот порядка колонок и словарь имён источника - для прохода 2
+    snap = profile(a.dsn, a.schema)
+    columns_order: dict[str, list[str]] = {}
+    for c in snap.columns:
+        columns_order.setdefault(c.table, []).append(c.name)
+
+    # корпуса проверяются ДО прогона: непроверенный материал замен - это данные,
+    # которые уедут в staging. Предел длины берётся из колонок-потребителей.
+    limits = corpus_limits({q: pc.sem_type for q, pc in plan.columns.items()
+                            if pc.strategy == "fake"},
+                           {c.qualified: c.max_len for c in snap.columns})
+    problems = validate_corpus(corpora, limits)
+    if problems:
+        print("КОРПУС ОТКЛОНЁН (fail-closed) - материал замен негоден:")
+        for p in problems:
+            print(f"  {p}")
+        print("Дальше: почините компоненты корпуса и повторите run.")
+        return 1
+
     rl = RunLog(work / "runlog.db")
     run_id = rl.start_run(plan.schema_fingerprint, salt.recipient, salt.generation,
                           master_salt_version=salt.version)
     print(f"run_id={run_id}")
-
-    # снапшот порядка колонок и словарь имён источника - для прохода 2
-    snap = profile(a.dsn, "hr")
-    columns_order: dict[str, list[str]] = {}
-    for c in snap.columns:
-        columns_order.setdefault(c.table, []).append(c.name)
-    name_dict = _source_name_dict(a.dsn)
+    name_dict = _source_name_dict(a.dsn, a.schema)
 
     dump_dir = run_pass1(plan, a.dsn, salt, corpora, work, rl, run_id,
                          greenmask_bin=a.greenmask, plan_path=Path(a.plan))
@@ -127,14 +152,21 @@ def _resolve_dump(path: Path) -> Path:
     return max(subdirs, key=lambda p: int(p.name))
 
 
-def _source_name_dict(dsn: str) -> frozenset[str]:
-    """Словарь ФИО источника для точного NER (§5.5); живёт в контуре."""
+def _source_name_dict(dsn: str, schema: str = "hr") -> frozenset[str]:
+    """Словарь ФИО источника для точного NER (§5.5); живёт в контуре.
+    Собирается по всем колонкам схемы с именами компонент ФИО, а не по одной
+    зашитой таблице: на чужой базе employees может не быть вовсе."""
     import psycopg
 
     words: set[str] = set()
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
-        for col in ("last_name", "first_name", "middle_name"):
-            cur.execute(f"SELECT DISTINCT {col} FROM hr.employees WHERE {col} IS NOT NULL")
+        cur.execute(
+            "SELECT table_schema || '.' || table_name, column_name "
+            "FROM information_schema.columns WHERE table_schema = %s "
+            "AND column_name IN ('last_name','first_name','middle_name','patronymic')",
+            (schema,))
+        for table, col in cur.fetchall():
+            cur.execute(f"SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL")
             words |= {r[0].lower().replace("ё", "е") for r in cur.fetchall()}
     return frozenset(words)
 
@@ -177,7 +209,40 @@ def cmd_verify(a) -> int:
         print("ВЕРИФИКАЦИЯ ПРОВАЛЕНА - публикация дампа заблокирована (run_log)")
         return 1
     rl.mark("verify", "*", "done")
-    print(f"Публикация разрешена: publishable={rl.publishable(run_id)}")
+    print(f"Верификация пройдена. Дальше: python -m sanitizer.cli publish --to <каталог> "
+          f"(разрешено={rl.publishable(run_id)})")
+    return 0
+
+
+# START_CONTRACT: cmd_publish
+#   PURPOSE: Единственный путь, которым дамп покидает рабочий каталог. Гейт
+#            публикации - механизм, а не рекомендация: без verify=done копия
+#            не создаётся вовсе (разбор 4, находка 14).
+#   INPUTS: { work: рабочий каталог прогона, to: каталог публикации }
+#   OUTPUTS: { 0 - опубликовано; 1 - запрещено или уже опубликовано }
+#   SIDE_EFFECTS: копирование каталога дампа
+# END_CONTRACT: cmd_publish
+def cmd_publish(a) -> int:
+    import shutil
+
+    work = Path(a.work)
+    run_id = (work / "run_id").read_text(encoding="utf-8").strip()
+    rl = RunLog(work / "runlog.db")
+    if not rl.publishable(run_id):
+        print(f"ПУБЛИКАЦИЯ ЗАПРЕЩЕНА для run_id={run_id}: журнал прогона не подтверждает,")
+        print("что все стадии завершены и верификация пройдена. Записи журнала:")
+        for stage, tbl, status, _ in rl.entries(run_id):
+            print(f"  {stage:7} {tbl:22} {status}")
+        print("Дальше: устраните причину, повторите run и verify.")
+        return 1
+    dump = _resolve_dump(Path((work / "dump_path").read_text(encoding="utf-8").strip()))
+    dst = Path(a.to) / run_id
+    if dst.exists():
+        print(f"ОТКАЗ: {dst} уже существует - публикация не перезаписывает опубликованное.")
+        return 1
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(dump, dst)
+    print(f"опубликовано: {dst}")
     return 0
 
 
@@ -209,6 +274,7 @@ def main() -> int:
     p.add_argument("--config", default="sanitizer/demo/plan-config.json")
     p.add_argument("--llm-cache", default="tests/fixtures/llm_votes_demo.json")
     p.add_argument("--plan", default="out/sanitization-plan.yaml")
+    p.add_argument("--schema", default="hr")
     p.add_argument("--auto-approve", action="store_true")
     p.set_defaults(fn=cmd_plan)
 
@@ -217,6 +283,7 @@ def main() -> int:
     p.add_argument("--plan", default="out/sanitization-plan.yaml")
     p.add_argument("--components", default=DEF_COMPONENTS)
     p.add_argument("--work", default="out")
+    p.add_argument("--schema", default="hr")
     p.add_argument("--greenmask", default=os.environ.get("GREENMASK_BIN", "greenmask"))
     p.set_defaults(fn=cmd_run)
 
@@ -239,6 +306,11 @@ def main() -> int:
     p.add_argument("--work", default="out")
     p.add_argument("--report", default="out/verify-report.md")
     p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("publish")
+    p.add_argument("--work", default="out")
+    p.add_argument("--to", default="out/published")
+    p.set_defaults(fn=cmd_publish)
 
     p = sub.add_parser("report")
     p.add_argument("--src-dsn", default=os.environ.get("DEMO_DSN", "postgresql://demo:demo@127.0.0.1:55432/demo"))

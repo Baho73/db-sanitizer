@@ -10,6 +10,7 @@
 #
 # START_MODULE_MAP
 #   Salt - производная соль HMAC(master[v], recipient, generation)
+#   salt_fingerprint - необратимый отпечаток соли для сверки проходов
 #   Mapper - отображение значений в замены по корпусам
 #   normalize_fio - ключ идентичности ФИО (леммы + род)
 #   normalize_phone - ключ идентичности телефона
@@ -50,6 +51,13 @@ class Salt:
     def effective(self) -> bytes:
         msg = f"{self.recipient}\x00{self.generation}".encode()
         return _hmac.new(self.master, msg, hashlib.sha256).digest()
+
+
+def salt_fingerprint(salt: Salt) -> str:
+    """Сравнимый необратимый отпечаток производной соли. Нужен, чтобы два прохода
+    (родительский и дочерний Cmd-процесс Greenmask) доказали, что работают на одной
+    соли: они связаны только переменными окружения."""
+    return hashlib.sha256(b"fp\x00" + salt.effective).hexdigest()[:16]
 
 
 def _h(salt: Salt, *parts: str) -> int:

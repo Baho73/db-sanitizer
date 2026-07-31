@@ -7,7 +7,7 @@
     </M-MAPPER>
     <M-CORPUS>
       <Path>sanitizer/corpus.py</Path>
-      <Purpose>Корпуса значений: загрузка компонент (fixtures/LLM-кэш), нормализация, валидатор (формат, КС, дубли, длина под колонку-потребителя).</Purpose>
+      <Purpose>Корпуса значений: загрузка компонент (fixtures/LLM-кэш), нормализация, валидатор (формат, КС, дубли, длина под колонку-потребителя). Валидатор вызывается конвейером ДО прогона и роняет run; предел длины считается из плана и снимка через corpus_limits - без этой связи проверка длины не срабатывала никогда.</Purpose>
       <DependsOn><M-MAPPER /></DependsOn>
     </M-CORPUS>
     <M-DEMO-DB>
@@ -32,7 +32,7 @@
     </M-FK-CLOSURE>
     <M-POLICY>
       <Path>sanitizer/policy.py</Path>
-      <Purpose>Стратегия и LLM-режим по осям чувствительность×кардинальность; модель sanitization-plan.yaml; fail-closed валидация (ПДн в direct, fake на категориях малой кардинальности, null/generalize без подтверждения и без автора, jsonb без разметки или с неразмеченным ключом, ключ-ПДн с неинъективной заменой, дрейф схемы); дифф планов по решениям, без полей аудита. Отпечаток схемы включает ключи jsonb: новый ключ внутри jsonb - такой же дрейф, как новая колонка.</Purpose>
+      <Purpose>Стратегия и LLM-режим по осям чувствительность×кардинальность; модель sanitization-plan.yaml; fail-closed валидация (ПДн в direct, fake на категориях малой кардинальности, null/generalize без подтверждения и без автора, jsonb без разметки или с неразмеченным ключом, ключ-ПДн с неинъективной заменой, llm_mode=direct без поставщика LLM, дрейф схемы); дифф планов по решениям, без полей аудита. Стратегия direct = материализованная карта 1:1; llm_mode говорит, КТО её произвёл (модель или детерминированный генератор из корпуса). Отпечаток схемы включает ключи jsonb: новый ключ внутри jsonb - такой же дрейф, как новая колонка.</Purpose>
       <DependsOn><M-CLASSIFIER /><M-FK-CLOSURE /><M-PROFILER /></DependsOn>
     </M-POLICY>
     <M-PLAN-GRAPH>
@@ -42,7 +42,7 @@
     </M-PLAN-GRAPH>
     <M-EXECUTOR>
       <Path>sanitizer/executor.py, sanitizer/cmd_transformer.py</Path>
-      <Purpose>Проход 1: артефакты (direct-карты, shuffle-перестановки с детерминированным seed), генерация config.yml Greenmask (классы только через Cmd), запуск dump; Cmd-процесс - протокол json-строк, SIGTERM->exit 0, пропуск строки метаданных. Внутри jsonb обход идёт по ключам ДАННЫХ, а не разметки: неразмеченный ключ обнуляется, а не пропускается нетронутым.</Purpose>
+      <Purpose>Проход 1: артефакты (карты 1:1 для strategy=direct, shuffle-перестановки с детерминированным seed, отпечаток соли для сверки с дочерним процессом), генерация config.yml Greenmask (классы только через Cmd), запуск dump; Cmd-процесс - протокол json-строк, SIGTERM->exit 0, пропуск строки метаданных. Внутри jsonb обход идёт по ключам ДАННЫХ, а не разметки: неразмеченный ключ обнуляется, а не пропускается нетронутым.</Purpose>
       <DependsOn><M-MAPPER /><M-CORPUS /><M-POLICY /><M-RUNLOG /></DependsOn>
     </M-EXECUTOR>
     <M-POSTPROC>
@@ -57,7 +57,7 @@
     </M-VERIFIER>
     <M-RUNLOG>
       <Path>sanitizer/runlog.py</Path>
-      <Purpose>Журнал прогонов (SQLite в контуре): стадии pass1/pass2/verify по таблицам, версии плана/соли/корпуса/кэша/инструмента, гейт публикации publishable().</Purpose>
+      <Purpose>Журнал прогонов (SQLite в контуре): стадии pass1/pass2/verify по таблицам, версии плана/соли/корпуса/кэша/инструмента, гейт публикации publishable(). Гейт - механизм, а не рекомендация: подкоманда publish не создаёт копию дампа, пока журнал не подтвердит verify=done. Порядок записей по rowid: часы контейнеров ненадёжны.</Purpose>
       <DependsOn></DependsOn>
     </M-RUNLOG>
     <M-REPORT>
@@ -67,7 +67,7 @@
     </M-REPORT>
     <M-CLI>
       <Path>sanitizer/cli.py</Path>
-      <Purpose>Подкоманды demo-seed / plan / run / restore / verify; сообщения fail-closed с именем колонки и следующим шагом; словарь ФИО источника для NER.</Purpose>
+      <Purpose>Подкоманды demo-seed / plan / run / restore / verify / publish / report; сообщения fail-closed с именем колонки и следующим шагом; словарь ФИО источника для NER собирается по колонкам схемы, а не по зашитой таблице. MASTER_SALT обязателен: умолчания у единственного секрета системы нет намеренно.</Purpose>
       <DependsOn><M-PLAN-GRAPH /><M-EXECUTOR /><M-POSTPROC /><M-VERIFIER /><M-DEMO-DB /></DependsOn>
     </M-CLI>
     <DF-PLAN>
