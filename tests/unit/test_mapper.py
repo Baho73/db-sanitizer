@@ -3,8 +3,8 @@
 import random
 
 from sanitizer.mapper import (
-    Mapper, Salt, feminize, gen_digits_like, gen_inn10, gen_inn12, gen_int_in_range,
-    gen_ogrn, gen_snils, normalize_email, normalize_fio, normalize_phone,
+    Mapper, Salt, feminize, gen_digits_like, gen_inn10, gen_inn12, gen_int_like,
+    gen_ogrn, gen_snils, normalize_email, normalize_fio, normalize_phone, pick_int,
     valid_inn, valid_ogrn, valid_snils,
 )
 
@@ -82,19 +82,19 @@ def test_generate_uniqueness_100k():
     assert len(seen) == 100_000
 
 
-def test_int_in_range_unique_for_unique_sources():
+def test_int_like_unique_for_unique_sources():
     # табельные номера под UNIQUE: 2001 исходник -> 2001 уникальная замена
-    outs = {gen_int_in_range(SALT, str(100000 + i), 100000, 999999) for i in range(2001)}
+    outs = {gen_int_like(SALT, str(100000 + i)) for i in range(2001)}
     assert len(outs) == 2001
     emails = {M.email(f"user{i}@corp-demo.ru") for i in range(2001)}
     assert len(emails) == 2001
 
 
-def test_int_in_range_and_digits_like():
+def test_pick_int_and_digits_like():
     rnd = random.Random(7)
     for _ in range(500):
         lo, hi = sorted(rnd.sample(range(1, 10_000), 2))
-        v = gen_int_in_range(SALT, str(rnd.random()), lo, hi)
+        v = pick_int(SALT, str(rnd.random()), lo, hi)
         assert lo <= v <= hi
     src = "Д-2024/117-А"
     out = gen_digits_like(SALT, src)

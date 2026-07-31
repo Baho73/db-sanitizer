@@ -25,7 +25,10 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sanitizer.mapper import Mapper, Salt, gen_digits_like, gen_snils, normalize_digits, valid_inn, valid_snils
+from sanitizer.mapper import (
+    Mapper, Salt, gen_digits_like, gen_inn10, gen_inn12, gen_snils, normalize_digits,
+    valid_inn, valid_snils,
+)
 from sanitizer.policy import Plan
 
 
@@ -58,41 +61,45 @@ class TextSanitizer:
     #   OUTPUTS: { (str, list[str]) - текст и коды деградаций (low_confidence_ner) }
     #   SIDE_EFFECTS: пополняет llm_cache и stats
     # END_CONTRACT: sanitize_text
-    def sanitize_text(self, text: str) -> tuple[str, list[str]]:
+    def sanitize_text(self, text: str, aggressive: bool | None = None) -> tuple[str, list[str]]:
         # Адресная колонка: значение заменяется ЦЕЛИКОМ синтетическим адресом.
         # Патчить сущности внутри нельзя - нераспознанный остаток (посёлок, улица,
         # дом, квартира, код домофона) сохранился бы в копии, а §3.2 это запрещает.
-        if self.aggressive:
+        # Режим приходит аргументом, а не через мутацию поля в цикле: от порядка
+        # обхода колонок поведение зависеть не должно.
+        if aggressive is None:
+            aggressive = self.aggressive
+        if aggressive:
             return self.synthetic_address(text), []
         notes: list[str] = []
         out = _PHONE_RE.sub(lambda m: self.mapper.phone(m.group()), text)
         out = _EMAIL_RE.sub(lambda m: self.mapper.email(m.group()), out)
         out = _SNILS_RE.sub(lambda m: self._snils(m.group()), out)
         out = _PASSPORT_RE.sub(lambda m: gen_digits_like(self.salt, m.group()), out)
-        out = _INN_RE.sub(lambda m: gen_digits_like(self.salt, m.group())
-                          if valid_inn(m.group()) else m.group(), out)
+        # ИНН в тексте заменяется ТЕМ ЖЕ генератором, что и структурная колонка:
+        # иначе один ИНН получает две разные замены, и склейка «ООО X, ИНН ...»
+        # перестаёт сходиться с таблицей контрагентов
+        out = _INN_RE.sub(lambda m: self._inn(m.group()), out)
         out = _FIO_INITIALS_RE.sub(lambda m: self._fio_initials(m), out)
-        out = _CAP_PAIR_RE.sub(lambda m: self._cap_pair(m, notes), out)
+        out = _CAP_PAIR_RE.sub(lambda m: self._cap_pair(m, notes, aggressive), out)
         return out, notes
 
     # START_CONTRACT: synthetic_address
-    #   PURPOSE: Полная замена адресной строки синтетическим адресом. Ключ -
-    #            нормализованная исходная строка целиком: одинаковые адреса дают
-    #            одинаковую замену, ничего от оригинала не переносится.
+    #   PURPOSE: Полная замена адресной строки. Делегирует Mapper: генератор
+    #            обязан быть один на оба прохода, иначе один адрес в колонке и в
+    #            тексте получает две разные замены.
     #   INPUTS: { raw: str - исходная строка любой грязности }
     #   OUTPUTS: { str - «Регион, г. Город, ул. Улица, д. N, кв. M» }
     #   SIDE_EFFECTS: none
     # END_CONTRACT: synthetic_address
     def synthetic_address(self, raw: str) -> str:
-        from sanitizer.mapper import gen_int_in_range
+        return self.mapper.synthetic_address(raw)
 
-        key = " ".join(raw.lower().replace("ё", "е").split())
-        region = self.mapper.address_component("region", key).title()
-        city = self.mapper.address_component("city", key + "|c").title()
-        street = self.mapper.address_component("street", key + "|s").title()
-        house = gen_int_in_range(self.salt, key + "|h", 1, 99)
-        flat = gen_int_in_range(self.salt, key + "|f", 1, 250)
-        return f"{region}, г. {city}, ул. {street}, д. {house}, кв. {flat}"
+    def _inn(self, raw: str) -> str:
+        d = normalize_digits(raw)
+        if not valid_inn(d):
+            return raw
+        return gen_inn12(self.salt, d) if len(d) > 10 else gen_inn10(self.salt, d)
 
     def _snils(self, raw: str) -> str:
         d = normalize_digits(raw)
@@ -102,7 +109,7 @@ class TextSanitizer:
         fam, i1, i2 = self.mapper.initials(m.group(1), m.group(2), m.group(3))
         return f"{fam.capitalize()} {i1.upper()}.{i2.upper()}."
 
-    def _cap_pair(self, m: re.Match, notes: list[str]) -> str:
+    def _cap_pair(self, m: re.Match, notes: list[str], aggressive: bool = False) -> str:
         """«Имя Фамилия» / «Фамилия Имя Отчество»: словарный NER (словарь пополняется
         известными ФИО источника - он живёт в контуре); ниже порога - LLM.
         Уверенная замена только когда КАЖДОЕ слово распознано - иначе пара
@@ -120,7 +127,7 @@ class TextSanitizer:
                 return m.group()
             if verdict is None:
                 notes.append("low_confidence_ner")  # деградация фиксируется (§5.7.1)
-                if not self.aggressive:
+                if not aggressive:
                     return m.group()
                 # агрессивный режим (адресные колонки, §3.2): неуверенное ЗАМЕНЯЕТСЯ -
                 # нераспознанный остаток не сохраняется никогда
@@ -195,7 +202,8 @@ def toc_tables(dump_dir: Path, pg_restore: str = "pg_restore") -> dict[str, str]
 #   SIDE_EFFECTS: перезапись .dat.gz, запись sanitization.sql, run_log
 # END_CONTRACT: process_dump
 def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]],
-                 ts: TextSanitizer, runlog=None, pg_restore: str = "pg_restore") -> dict:
+                 ts: TextSanitizer, runlog=None, pg_restore: str = "pg_restore",
+                 max_len: dict[str, int | None] | None = None) -> dict:
     free_cols: dict[str, list[str]] = {}
     length_policy: dict[str, str] = {}
     for qualified, pc in plan.columns.items():
@@ -204,6 +212,8 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
             free_cols.setdefault(table, []).append(col)
             length_policy[qualified] = pc.length_policy
 
+    limits = max_len or {}
+    widen: dict[str, int] = {}
     notes_rows: list[tuple] = []
     summary: dict = {}
     for dumpid, table in toc_tables(dump_dir, pg_restore).items():
@@ -228,11 +238,24 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
                 for i, qualified in idxs.items():
                     if fields[i] == "\\N":
                         continue
-                    ts.aggressive = plan.columns[qualified].sem_type == "address"
-                    new, notes = ts.sanitize_text(_copy_unescape(fields[i]))
-                    max_len = None  # длина колонки контролируется политикой
-                    if length_policy[qualified] == "truncate" and max_len:
-                        new = new[:max_len]
+                    aggressive = plan.columns[qualified].sem_type == "address"
+                    new, notes = ts.sanitize_text(_copy_unescape(fields[i]), aggressive)
+                    # Политика длины исполняется, а не декларируется: замена адреса
+                    # даёт +46 знаков, и переполнение раньше вылезало на pg_restore -
+                    # то есть ПОСЛЕ того, как верификация показала «зелено».
+                    limit = limits.get(qualified)
+                    if limit and len(new) > limit:
+                        policy = length_policy[qualified]
+                        if policy == "truncate":
+                            new = new[:limit]
+                            notes = notes + ["truncated_to_column_length"]
+                        elif policy == "widen":
+                            widen[qualified] = max(widen.get(qualified, 0), len(new))
+                        else:
+                            raise ValueError(
+                                f"{qualified}: замена длиной {len(new)} не влезает в "
+                                f"{limit}; length_policy=fail. Дальше: выберите "
+                                f"truncate или widen в плане для этой колонки.")
                     fields[i] = _copy_escape(new)
                     for code in notes:
                         degraded += 1
@@ -244,30 +267,61 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
         if runlog:
             runlog.mark("pass2", table, "done")
 
-    _write_sanitization_sql(dump_dir, notes_rows, summary)
+    _write_sanitization_sql(dump_dir, notes_rows, summary, widen)
     return summary
 
 
+_UNESCAPE = {"t": "\t", "n": "\n", "r": "\r", "\\": "\\"}
+
+
 def _copy_unescape(s: str) -> str:
-    return s.replace("\\t", "\t").replace("\\n", "\n").replace("\\\\", "\\")
+    """Один проход слева направо. Последовательные replace были неверны в
+    принципе: «\\\\t» (литеральный слэш и буква t) сначала превращался в табуляцию,
+    и текст с обратным слэшем портился безвозвратно."""
+    out: list[str] = []
+    it = iter(s)
+    for ch in it:
+        if ch != "\\":
+            out.append(ch)
+            continue
+        nxt = next(it, "")
+        out.append(_UNESCAPE.get(nxt, "\\" + nxt))
+    return "".join(out)
 
 
 def _copy_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+    return (s.replace("\\", "\\\\").replace("\t", "\\t")
+             .replace("\n", "\\n").replace("\r", "\\r"))
 
 
-def _write_sanitization_sql(dump_dir: Path, notes: list[tuple], summary: dict):
-    """Примечания §5.7.1 внутри каталога дампа; применяются командой restore."""
+def _q(value: str) -> str:
+    """Строковый литерал SQL. Значения приходят из дампа: PK бывает текстовым, и
+    апостроф внутри ломал sanitization.sql, который исполняется на staging."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _write_sanitization_sql(dump_dir: Path, notes: list[tuple], summary: dict,
+                            widen: dict[str, int] | None = None):
+    """Примечания §5.7.1 внутри каталога дампа; применяются командой restore.
+    Скрипт идемпотентен: restore на непустую staging повторяется без ошибок."""
     lines = [
         "CREATE SCHEMA IF NOT EXISTS sanitization;",
-        "CREATE TABLE sanitization.notes (table_name text, row_pk text, column_name text, reason text);",
-        "CREATE TABLE sanitization.summary (table_name text, rows int, degraded int);",
+        "CREATE TABLE IF NOT EXISTS sanitization.notes "
+        "(table_name text, row_pk text, column_name text, reason text);",
+        "CREATE TABLE IF NOT EXISTS sanitization.summary "
+        "(table_name text, rows int, degraded int);",
+        "TRUNCATE sanitization.notes; TRUNCATE sanitization.summary;",
     ]
+    for qualified, length in sorted((widen or {}).items()):
+        table, col = qualified.rsplit(".", 1)
+        lines.append(f"ALTER TABLE {table} ALTER COLUMN {col} TYPE varchar({length});")
     if len(notes) <= 10_000:  # построчно только меньшинство (§5.7.1 п.3)
         for t, pk, col, code in notes:
-            lines.append(f"INSERT INTO sanitization.notes VALUES ('{t}', '{pk}', '{col}', '{code}');")
+            lines.append("INSERT INTO sanitization.notes VALUES "
+                         f"({_q(t)}, {_q(pk)}, {_q(col)}, {_q(code)});")
     for t, s in summary.items():
-        lines.append(f"INSERT INTO sanitization.summary VALUES ('{t}', {s['rows']}, {s['degraded']});")
+        lines.append(f"INSERT INTO sanitization.summary VALUES "
+                     f"({_q(t)}, {s['rows']}, {s['degraded']});")
     (dump_dir / "sanitization.sql").write_text("\n".join(lines), encoding="utf-8")
 
 

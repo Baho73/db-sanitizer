@@ -1,7 +1,8 @@
 {
   "sensitive_categories": ["hr.positions.grade"],
   "json_map": {
-    "hr.employees.attrs": {"phone": "phone", "emergency": "fio_full", "note": "keep"}
+    "hr.employees.attrs": {"phone": "phone", "emergency": "fio_full", "note": "keep",
+                           "snils": "snils"}
   },
   "overrides": {
     "hr.employees.f_115": {"sem_type": "category", "strategy": "keep", "reason": "human: код грейда, не ПДн"},

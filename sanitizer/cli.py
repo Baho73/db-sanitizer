@@ -136,7 +136,8 @@ def cmd_run(a) -> int:
     print(f"проход 1 завершён: {dump_dir}")
 
     ts = TextSanitizer(Mapper(salt, corpora), salt, name_dict)
-    summary = process_dump(dump_dir, plan, columns_order, ts, runlog=rl)
+    summary = process_dump(dump_dir, plan, columns_order, ts, runlog=rl,
+                           max_len={c.qualified: c.max_len for c in snap.columns})
     print(f"проход 2 завершён: {json.dumps(summary, ensure_ascii=False)}")
     (work / "run_id").write_text(run_id, encoding="utf-8")
     (work / "dump_path").write_text(str(dump_dir), encoding="utf-8")

@@ -11,7 +11,7 @@
 # START_MODULE_MAP
 #   Salt - производная соль HMAC(master[v], recipient, generation)
 #   salt_fingerprint - необратимый отпечаток соли для сверки проходов
-#   Mapper - отображение значений в замены по корпусам
+#   Mapper - отображение значений в замены по корпусам (включая synthetic_address)
 #   normalize_fio - ключ идентичности ФИО (леммы + род)
 #   normalize_phone - ключ идентичности телефона
 #   normalize_email - ключ идентичности email
@@ -22,8 +22,9 @@
 #   gen_inn12 - ИНН 12 знаков из хэша с контрольными суммами
 #   gen_snils - СНИЛС из хэша с контрольным числом
 #   gen_ogrn - ОГРН/ОГРНИП из хэша с контрольной цифрой
-#   gen_int_in_range - целое в диапазоне без коллизий (Фейстель + cycle-walking)
-#   gen_digits_like - формат-сохраняющая замена цифр
+#   gen_int_like - целое той же разрядности без коллизий (Фейстель + cycle-walking)
+#   pick_int - число в диапазоне по ключу; НЕ инъективна, только для дома/квартиры
+#   gen_digits_like - формат-сохраняющая инъективная замена цифр
 #   valid_inn - проверка контрольной суммы ИНН
 #   valid_snils - проверка контрольного числа СНИЛС
 #   valid_ogrn - проверка контрольной цифры ОГРН
@@ -207,8 +208,25 @@ class Mapper:
         return f"{_translit(fam)}.{suffix}@{domain}"
 
     def address_component(self, kind: str, value: str) -> str:
-        """kind: region|city|street; дом - gen_int_in_range."""
+        """kind: region|city|street; дом и квартира - pick_int."""
         return self.pick(kind, _norm_word(value), avoid=value)
+
+    # START_CONTRACT: synthetic_address
+    #   PURPOSE: Полная замена адресной строки. ЕДИНСТВЕННАЯ реализация на оба
+    #            прохода: структурная колонка и тот же адрес в свободном тексте
+    #            обязаны дать одну строку, иначе один адрес в базе разъезжается.
+    #   INPUTS: { raw: str - исходная строка любой грязности }
+    #   OUTPUTS: { str - «Регион, г. Город, ул. Улица, д. N, кв. M» }
+    #   SIDE_EFFECTS: none
+    # END_CONTRACT: synthetic_address
+    def synthetic_address(self, raw: str) -> str:
+        key = " ".join(raw.lower().translate(_YO).split())
+        region = self.address_component("region", key).title()
+        city = self.address_component("city", key + "|c").title()
+        street = self.address_component("street", key + "|s").title()
+        house = pick_int(self.salt, key + "|h", 1, 99)
+        flat = pick_int(self.salt, key + "|f", 1, 250)
+        return f"{region}, г. {city}, ул. {street}, д. {house}, кв. {flat}"
 
 
 _TR = {"а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ж": "zh", "з": "z", "и": "i",
@@ -291,29 +309,52 @@ def gen_ogrn(salt: Salt, src: str, ip: bool = False) -> str:
     return str(body).zfill(12) + str(body % 11 % 10)
 
 
-def gen_int_in_range(salt: Salt, src: str, lo: int, hi: int) -> int:
-    """Табельный номер, номер дома: целое в [lo, hi] БЕЗ коллизий - Фейстель
-    с cycle-walking (биекция на [0, size) при исходниках одного диапазона).
-    Хэш-в-диапазон здесь запрещён: парадокс дней рождения ломает UNIQUE."""
-    size = hi - lo + 1
-    n_digits = max(2, len(str(size - 1)))
-    label = f"range{lo}-{hi}"
-    y = int(normalize_digits(src) or "0") % size
-    y = _fpe(salt, label, y, n_digits)
-    while y >= size:
-        y = _fpe(salt, label, y, n_digits)
-    return lo + y
+def gen_int_like(salt: Salt, src: str) -> int:
+    """Табельный номер и прочие целые под UNIQUE: замена той же разрядности,
+    БЕЗ коллизий. Перестановка Фейстеля на [0, 10^n) с cycle-walking внутрь
+    [10^(n-1), 10^n) - биекция на множестве n-значных чисел, поэтому разные
+    исходники разной разрядности попадают в непересекающиеся диапазоны.
+
+    Прежняя реализация брала `int(src) % size` ДО перестановки: остаток по модулю
+    склеивает исходники, различающиеся на размер окна (100001 и 1000001 давали
+    одно и то же), - ровно та коллизия, которую запрещал собственный контракт.
+
+    Неподвижная точка (замена совпала с исходником) возможна с вероятностью
+    ~10^-n и не маскируется сдвигом: сдвиг ломает инъективность. Такой случай
+    ловит построчная проверка fake(x)!=x и лечится сменой поколения соли."""
+    digits = normalize_digits(src) or "0"
+    n = len(digits)
+    if n < 2:
+        return int(digits)  # однозначные оставляем: перестановки на 10 значениях мало
+    lo = 10 ** (n - 1)
+    y = int(digits)
+    label = f"int{n}"
+    while True:
+        y = _fpe(salt, label, y, n)
+        if y >= lo:
+            return y
+
+
+def pick_int(salt: Salt, key: str, lo: int, hi: int) -> int:
+    """Число в диапазоне по произвольному ключу. НЕ инъективна и не претендует:
+    применяется там, где уникальность не нужна и не проверяется, - номер дома и
+    квартиры внутри синтетического адреса. Для колонок под UNIQUE - gen_int_like."""
+    return lo + _h(salt, f"range{lo}-{hi}", key) % (hi - lo + 1)
 
 
 def gen_digits_like(salt: Salt, src: str) -> str:
-    """Номер договора: формат исходного, цифры замещены из хэша. fake != src."""
-    h = str(_h(salt, "digits", src))
-    it = iter(h * (len(src) // len(h) + 1))
-    out = "".join(next(it) if ch.isdigit() else ch for ch in src)
-    if out == src:  # все цифры случайно совпали - сдвиг последней
-        i = max(i for i, ch in enumerate(out) if ch.isdigit())
-        out = out[:i] + str((int(out[i]) + 1) % 10) + out[i + 1:]
-    return out
+    """Паспорт, номер договора: формат исходного сохранён, цифры переставлены
+    Фейстелем. Инъективна при неизменном «скелете» строки (позиции нецифровых
+    символов), а разные скелеты дают разные строки, - значит инъективна вообще.
+    Это важно: паспорт бывает ключом, а прежняя версия сыпала цифры из хэша и
+    коллизий не исключала."""
+    digits = normalize_digits(src)
+    if not digits:
+        return src
+    n = len(digits)
+    fake = str(_fpe(salt, f"digits{n}", int(digits), n)).zfill(n)
+    it = iter(fake)
+    return "".join(next(it) if ch.isdigit() else ch for ch in src)
 
 
 def valid_inn(s: str) -> bool:

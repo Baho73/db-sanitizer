@@ -23,8 +23,8 @@ from pathlib import Path
 
 from sanitizer.corpus import build_corpora, load_components
 from sanitizer.mapper import (
-    Mapper, Salt, gen_digits_like, gen_inn12, gen_int_in_range, gen_ogrn, gen_snils,
-    normalize_digits, salt_fingerprint,
+    Mapper, Salt, gen_digits_like, gen_inn10, gen_inn12, gen_int_like, gen_ogrn, gen_snils,
+    normalize_digits, pick_int, salt_fingerprint,
 )
 from sanitizer.policy import Plan
 
@@ -62,9 +62,12 @@ class RowTransformer:
         if fio:
             last_c, first_c, mid_c = fio
             f, n, p = self.mapper.fio(_d(row, last_c), _d(row, first_c), _d(row, mid_c))
-            _set(out, last_c, f.capitalize())
-            _set(out, first_c, n.capitalize())
-            _set(out, mid_c, p.capitalize())
+            # NULL остаётся NULL: ветка ФИО отрабатывала ДО проверки на null и
+            # превращала отсутствующее отчество в пустую строку - это меняло долю
+            # NULL, ломало «WHERE middle_name IS NULL» и подменяло семантику
+            for col, value in ((last_c, f), (first_c, n), (mid_c, p)):
+                if col and not (row.get(col) or {}).get("n"):
+                    _set(out, col, value.capitalize())
         for col, pc in self.cols.items():
             if col not in row or row[col].get("n") or (fio and col in fio):
                 continue
@@ -98,8 +101,11 @@ class RowTransformer:
     def _generate(self, sem_type: str, val: str) -> str:
         match sem_type:
             case "inn":
+                # 10 знаков - ИНН юрлица, у него своя контрольная сумма. Раньше
+                # эта ветка уходила в gen_digits_like, и КАЖДЫЙ ИНН организации
+                # получал невалидную КС: приложение падало на валидации.
                 return gen_inn12(self.salt, val) if len(normalize_digits(val)) > 10 \
-                    else gen_digits_like(self.salt, val)
+                    else gen_inn10(self.salt, val)
             case "snils":
                 return gen_snils(self.salt, val)
             case "ogrn":
@@ -107,7 +113,9 @@ class RowTransformer:
             case "email":
                 return self.mapper.email(val)
             case "person_id":
-                return str(gen_int_in_range(self.salt, val, 100000, 999999))
+                # разрядность сохраняется, окно не зашивается: табельные бывают
+                # какими угодно, а фиксированное [100000,999999] давало коллизии
+                return str(gen_int_like(self.salt, val))
             case _:  # passport и прочие форматные номера
                 return gen_digits_like(self.salt, val)
 
@@ -133,14 +141,9 @@ class RowTransformer:
                 return m.pick("org", val.lower(), avoid=val)
 
     def _fake_address(self, val: str) -> str:
-        """Покомпонентная замена валидного адреса: регион/город/улица из корпусов,
-        дом детерминированно. Формат «обл, г. X, ул. Y, д. N»."""
-        m = self.mapper
-        region = m.address_component("region", val).title()
-        city = m.address_component("city", val + "|c").title()
-        street = m.address_component("street", val + "|s").title()
-        house = gen_int_in_range(self.salt, val, 1, 99)
-        return f"{region}, г. {city}, ул. {street}, д. {house}"
+        """Тот же генератор, что у прохода 2: один исходный адрес обязан дать одну
+        замену и в колонке, и внутри свободного текста (§3.2, сквозная консистентность)."""
+        return self.mapper.synthetic_address(val)
 
     def _generalize(self, sem_type: str, val: str) -> str:
         if sem_type == "birth_date":
@@ -167,6 +170,10 @@ class RowTransformer:
                     parts = str(data[key]).split()
                     f, n, p = self.mapper.fio(*(parts + ["", "", ""])[:3])
                     data[key] = " ".join(x.capitalize() for x in (f, n, p) if x)
+                case "snils" | "inn" | "email" | "passport" | "person_id":
+                    # тем же генератором, что структурная колонка того же типа:
+                    # один СНИЛС в колонке и внутри jsonb - одна замена
+                    data[key] = self._generate(ftype, str(data[key]))
                 case "keep":
                     pass
                 case _:

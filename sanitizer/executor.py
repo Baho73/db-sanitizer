@@ -8,15 +8,13 @@
 # END_MODULE_CONTRACT
 #
 # START_MODULE_MAP
-#   salt_fingerprint - необратимый отпечаток производной соли для сверки проходов
-#   prepare_artifacts - direct-карты (LLM или corpus-fallback) + shuffle-карты
+#   prepare_artifacts - карты 1:1 (LLM или corpus-fallback), shuffle-карты, отпечаток соли
 #   greenmask_config - план -> config.yml (классы только через Cmd)
 #   run_pass1 - dump с журналированием
 # END_MODULE_MAP
 from __future__ import annotations
 
 import json
-import random
 import subprocess
 from pathlib import Path
 
@@ -72,17 +70,124 @@ def prepare_artifacts(plan: Plan, dsn: str, salt: Salt, corpora: dict[str, list[
                 p = out_dir / f"direct.{table}.{col}.json"
                 p.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
                 written.append(p)
-            elif pc.strategy == "shuffle":
-                cur.execute(f"SELECT id::text, {col}::text FROM {table} ORDER BY id")
-                rows = cur.fetchall()
-                values = [v for _, v in rows]
-                seed = _h(salt, "shuffle", table, col, str(plan.version))
-                random.Random(seed).shuffle(values)  # детерминированный seed (§5.3)
-                p = out_dir / f"shuffle.{table}.{col}.json"
-                p.write_text(json.dumps(dict(zip((pk for pk, _ in rows), values)),
-                                        ensure_ascii=False), encoding="utf-8")
-                written.append(p)
+        perms = _group_permutations(cur, plan, salt)
+        for qualified, pc in plan.columns.items():
+            if pc.strategy != "shuffle":
+                continue
+            table, col = qualified.rsplit(".", 1)
+            p = out_dir / f"shuffle.{table}.{col}.json"
+            p.write_text(json.dumps(_shuffle_map(cur, plan, table, col, perms),
+                                    ensure_ascii=False), encoding="utf-8")
+            written.append(p)
     return written
+
+
+def _single_pk(cur, table: str) -> str:
+    schema, name = table.split(".", 1)
+    cur.execute(
+        "SELECT kcu.column_name FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "  ON kcu.constraint_name = tc.constraint_name "
+        " AND kcu.table_schema = tc.table_schema AND kcu.table_name = tc.table_name "
+        "WHERE tc.table_schema = %s AND tc.table_name = %s "
+        "  AND tc.constraint_type = 'PRIMARY KEY'", (schema, name))
+    cols = [r[0] for r in cur.fetchall()]
+    if len(cols) != 1:
+        raise ValueError(
+            f"{table}: перемешивание требует одноколоночного первичного ключа, "
+            f"найдено {cols}. Дальше: выберите для колонки другую стратегию.")
+    return cols[0]
+
+
+def _entity_column(plan: Plan, table: str, pk: str) -> tuple[str, str]:
+    """Ключ сущности таблицы и имя группы перемешивания. Группа - класс
+    эквивалентности по FK: employees.id и payroll.employee_id лежат в одном
+    классе, значит зарплата и начисления одного человека должны переехать
+    к одному и тому же другому человеку."""
+    # Приоритет у класса, в который входит ПЕРВИЧНЫЙ ключ таблицы: именно он
+    # обозначает саму сущность. Без этого приоритета hr.employees попадала в
+    # первый попавшийся класс (position_id) и перемешивалась по должности, а
+    # hr.payroll - по сотруднику: группы разные, связь по-прежнему рвалась.
+    own = [cls for cls in plan.classes if f"{table}.{pk}" in cls]
+    if own:
+        return pk, "|".join(sorted(own[0]))
+    linked = sorted((sorted(cls), cls) for cls in plan.classes
+                    if any(c.rsplit(".", 1)[0] == table for c in cls))
+    if linked:
+        cls = linked[0][0]
+        mine = next(c for c in cls if c.rsplit(".", 1)[0] == table)
+        return mine.rsplit(".", 1)[1], "|".join(cls)
+    return pk, f"{table}.{pk}"          # таблица ни с кем не связана - сама себе группа
+
+
+# START_CONTRACT: _group_permutations
+#   PURPOSE: Одна перестановка сущностей на группу связанных колонок. Строится по
+#            ОБЪЕДИНЕНИЮ значений ключа сущности во всех таблицах группы: у
+#            employees 2001 сотрудник, у payroll 2000, и перестановка, собранная
+#            по каждому набору отдельно, разъезжается сдвигом на один элемент.
+#   INPUTS: { cur: курсор, plan, salt }
+#   OUTPUTS: { dict имя группы -> (колонка-сущность по таблице, перестановка) }
+#   SIDE_EFFECTS: чтение источника
+# END_CONTRACT: _group_permutations
+def _group_permutations(cur, plan: Plan, salt: Salt) -> dict:
+    members: dict[str, dict[str, str]] = {}          # группа -> таблица -> колонка-сущность
+    for qualified, pc in plan.columns.items():
+        if pc.strategy != "shuffle":
+            continue
+        table = qualified.rsplit(".", 1)[0]
+        entity, group = _entity_column(plan, table, _single_pk(cur, table))
+        members.setdefault(group, {})[table] = entity
+
+    out: dict[str, dict] = {}
+    for group, tables in members.items():
+        union: set[str] = set()
+        for table, entity in tables.items():
+            cur.execute(f"SELECT DISTINCT {entity}::text FROM {table} WHERE {entity} IS NOT NULL")
+            union |= {r[0] for r in cur.fetchall()}
+        ids = sorted(union)
+        targets = sorted(ids, key=lambda e: _h(salt, "shuffle", group, str(plan.version), e))
+        out[group] = {"entity": tables, "perm": dict(zip(ids, targets))}
+    return out
+
+
+def _induced(perm: dict[str, str], present: set[str], e: str) -> str:
+    """Перестановка группы, суженная на сущности одной таблицы: идём по циклу,
+    пока не попадём в имеющиеся. Сужение перестановки на подмножество остаётся
+    перестановкой, поэтому мультимножество значений колонки сохраняется точно."""
+    seen = 0
+    cur_e = perm.get(e, e)
+    while cur_e not in present and seen < len(perm):
+        cur_e = perm.get(cur_e, cur_e)
+        seen += 1
+    return cur_e if cur_e in present else e
+
+
+# START_CONTRACT: _shuffle_map
+#   PURPOSE: Перестановка значений колонки ПО СУЩНОСТИ, а не по строке. Прежний
+#            seed зависел от таблицы и колонки, поэтому employees.salary и
+#            payroll.amount перемешивались независимо и связь «зарплата - её
+#            начисления» рвалась (проверено: корреляция 1.00 -> 0.06).
+#   INPUTS: { cur: курсор, plan, table, col, perms: из _group_permutations }
+#   OUTPUTS: { dict первичный ключ строки -> новое значение }
+#   SIDE_EFFECTS: чтение источника
+# END_CONTRACT: _shuffle_map
+def _shuffle_map(cur, plan: Plan, table: str, col: str, perms: dict) -> dict[str, str]:
+    pk = _single_pk(cur, table)
+    entity, group = _entity_column(plan, table, pk)
+    perm = perms[group]["perm"]
+    cur.execute(f"SELECT {pk}::text, {entity}::text, {col}::text FROM {table} "
+                f"ORDER BY {entity}, {pk}")
+    by_entity: dict[str, list[tuple[str, str]]] = {}
+    for row_pk, ent, value in cur.fetchall():
+        by_entity.setdefault(ent, []).append((row_pk, value))
+
+    present = set(by_entity)
+    out: dict[str, str] = {}
+    for src_ent, rows in by_entity.items():
+        donor = by_entity[_induced(perm, present, src_ent)]
+        for i, (row_pk, _) in enumerate(rows):
+            out[row_pk] = donor[i % len(donor)][1]
+    return out
 
 
 
@@ -130,10 +235,14 @@ def greenmask_config(plan: Plan, src_dsn: str, dump_dir: Path, plan_path: Path,
             }],
         })
     import os
+    # схема берётся из плана: дамп «только hr» молча терял бы всё остальное
+    schemas = sorted({q.split(".", 1)[0] for q in plan.columns})
+    if len(schemas) != 1:
+        raise ValueError(f"план охватывает несколько схем {schemas}; дамп делается по одной")
     return {
         "common": {"pg_bin_path": os.environ.get("PG_BIN_PATH", "/usr/bin"), "tmp_dir": "/tmp"},
         "storage": {"type": "directory", "directory": {"path": str(dump_dir)}},
-        "dump": {"pg_dump_options": {"dbname": src_dsn, "schema": "hr"},
+        "dump": {"pg_dump_options": {"dbname": src_dsn, "schema": schemas[0]},
                  "transformation": transformations},
     }
 
@@ -157,8 +266,17 @@ def run_pass1(plan: Plan, src_dsn: str, salt: Salt, corpora: dict, work_dir: Pat
         cfg = greenmask_config(plan, src_dsn, dump_dir, plan_path or work_dir / "plan.yaml", artifacts)
         cfg_path = work_dir / "greenmask.yml"
         cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+        # Соль передаётся дочернему процессу ЯВНО, а не подхватывается из
+        # окружения: единственный источник истины - объект Salt родителя.
+        # Отпечаток в артефактах остаётся вторым рубежом (ручной запуск Cmd).
+        import os
+        env = {**os.environ,
+               "MASTER_SALT": salt.master.decode(),
+               "RECIPIENT": salt.recipient,
+               "GENERATION": salt.generation,
+               "MASTER_SALT_VERSION": str(salt.version)}
         subprocess.run([greenmask_bin, "--config", str(cfg_path), "dump"],
-                       check=True, capture_output=True, text=True)
+                       check=True, capture_output=True, text=True, env=env)
         # greenmask пишет каждый дамп в подкаталог-метку времени
         latest = max((p for p in dump_dir.iterdir() if p.is_dir() and p.name.isdigit()),
                      key=lambda p: int(p.name))
