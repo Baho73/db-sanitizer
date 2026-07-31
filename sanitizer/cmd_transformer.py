@@ -89,6 +89,11 @@ class RowTransformer:
                     out[col] = {"d": None, "n": True}
                 case "jsonb":
                     _set(out, col, self._jsonb(val, pc.json_fields))
+                case _:
+                    # Неизвестная стратегия - отказ, а не «оставить как есть»:
+                    # молчаливый пропуск означал бы утечку при опечатке в плане.
+                    raise ValueError(f"{self.table}.{col}: неизвестная стратегия "
+                                     f"{pc.strategy!r} - прогон остановлен")
         return out
 
     def _fio_columns(self, row) -> tuple[str, str, str] | None:
@@ -132,6 +137,8 @@ class RowTransformer:
                 return m.pick("org", val.lower(), avoid=val).upper()[:160]
             case "address":
                 return self._fake_address(val)
+            case "email":
+                return m.email(val)
             case "family" | "name" | "patronymic":
                 f, n, p = m.fio(val if sem_type == "family" else "",
                                 val if sem_type == "name" else "",
@@ -148,7 +155,10 @@ class RowTransformer:
     def _generalize(self, sem_type: str, val: str) -> str:
         if sem_type == "birth_date":
             return f"{date.fromisoformat(val[:10]).year}-01-01"  # тип сохранён (§5.3)
-        return val
+        # Обобщение реализовано только для дат. Возврат исходника означал бы
+        # «стратегия применена», хотя значение не изменилось ни на символ.
+        raise ValueError(f"generalize не реализовано для типа {sem_type!r}; "
+                         f"выберите другую стратегию в плане")
 
     def _jsonb(self, val: str, fields: dict[str, str]) -> str:
         """Обход идёт по КЛЮЧАМ ДАННЫХ, а не по разметке: ключ, появившийся после

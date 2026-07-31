@@ -26,22 +26,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from sanitizer.mapper import (
-    Mapper, Salt, gen_digits_like, gen_inn10, gen_inn12, gen_ogrn, gen_snils,
-    normalize_digits, valid_inn, valid_ogrn, valid_snils,
+    Mapper, Salt, gen_digits_like, gen_inn10, gen_inn12, gen_luhn_like, gen_ogrn,
+    gen_snils, luhn_ok, normalize_digits, valid_inn, valid_ogrn, valid_snils,
 )
 from sanitizer.policy import Plan
 
 
 
-_PHONE_RE = re.compile(r"(?<!\d)(?:\+7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)")
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-zа-я]{2,}")
-_SNILS_RE = re.compile(r"(?<!\d)\d{3}-\d{3}-\d{3}[\s-]?\d{2}(?!\d)")
-# Идентификатор в тексте опознаётся КОНТРОЛЬНОЙ СУММОЙ, а не пунктуацией.
-# Прежние шаблоны ловили СНИЛС только с дефисами и ИНН только в 10/12 знаков;
-# база пишет СНИЛС подряд («09085653089»), и 783 таких значения доехали до
-# копии - мимо всех девяти проверок верификатора (разбор 5, находка 1).
-# Лидирующий «+» исключён: телефоны к этому моменту уже заменены.
-_ID_RUN_RE = re.compile(r"(?<![+\d-])\d{10,15}(?![\d-])")
+_PHONE_RE = re.compile(r"(?<!\d)(?:\+7|8|7)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)")
+# домены бывают кириллическими: ivan@домен.рф
+_EMAIL_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9._%+-]+@[A-Za-zА-Яа-яЁё0-9.-]+\.[A-Za-zА-Яа-яЁё]{2,}")
+# Идентификатор в тексте опознаётся КОНТРОЛЬНОЙ СУММОЙ, а не пунктуацией:
+# один токен ловит и «09085653089», и «123-456-789 64», и «123 456 789 64».
+# Разделители допускаются одиночные - иначе «заявка 12345 от 20 05 2026»
+# склеилась бы в одно число.
+_ID_TOKEN_RE = re.compile(r"(?<![+\d])\d(?:[\s-]?\d){9,18}(?!\d)")
 _PASSPORT_RE = re.compile(r"(?<!\d)\d{4}\s\d{6}(?!\d)")
 # ФИО: «Фамилия И.О.», «Фамилия Имя (Отчество)» - словарь имён + фамильные суффиксы
 _FIO_INITIALS_RE = re.compile(r"\b([А-ЯЁ][а-яё]+(?:ов|ев|ин|ын|ова|ева|ина|ына|ский|ская|цкий|цкая|ко|ук|юк)а?)\s+([А-ЯЁ])\.\s?([А-ЯЁ])\.")
@@ -77,17 +76,47 @@ class TextSanitizer:
         if aggressive:
             return self.synthetic_address(text), []
         notes: list[str] = []
-        out = _PHONE_RE.sub(lambda m: self.mapper.phone(m.group()), text)
-        out = _EMAIL_RE.sub(lambda m: self.mapper.email(m.group()), out)
-        out = _SNILS_RE.sub(lambda m: self._snils(m.group()), out)
-        out = _PASSPORT_RE.sub(lambda m: gen_digits_like(self.salt, m.group()), out)
-        # Идентификаторы заменяются ТЕМИ ЖЕ генераторами, что и структурные
-        # колонки: иначе один ИНН получает две разные замены, и склейка
-        # «ООО X, ИНН ...» перестаёт сходиться с таблицей контрагентов
-        out = _ID_RUN_RE.sub(lambda m: self._checksummed(m.group()), out)
-        out = _FIO_INITIALS_RE.sub(lambda m: self._fio_initials(m), out)
-        out = _CAP_PAIR_RE.sub(lambda m: self._cap_pair(m, notes, aggressive), out)
-        return out, notes
+
+        # ОДИН проход. Совпадения ищутся по ИСХОДНОМУ тексту, замены
+        # накладываются в конце, и заменённый участок повторно не рассматривается.
+        # Последовательные .sub() по уже изменённой строке давали двойную
+        # трансформацию: «123-456-789 64» заменялся в плоский СНИЛС, который
+        # тут же попадал под шаблон идентификатора и заменялся ВТОРОЙ раз -
+        # одно значение получало разные замены в двух написаниях, и сквозная
+        # консистентность §3.2 ломалась молча.
+        # Порядок: сначала то, что решается доказательством (контрольная сумма),
+        # потом форматные эвристики.
+        claimed: list[tuple[int, int, str]] = []
+
+        def vacant(start: int, end: int) -> bool:
+            return all(end <= s or start >= e for s, e, _ in claimed)
+
+        for pattern, handler in (
+            (_ID_TOKEN_RE, self._checksummed),
+            (_EMAIL_RE, lambda m: self.mapper.email(m.group())),
+            (_PHONE_RE, lambda m: self.mapper.phone(m.group())),
+            (_PASSPORT_RE, lambda m: gen_digits_like(self.salt, m.group())),
+            (_FIO_INITIALS_RE, self._fio_initials),
+            (_CAP_PAIR_RE, lambda m: self._cap_pair(m, notes, aggressive)),
+        ):
+            for m in pattern.finditer(text):
+                if not vacant(*m.span()):
+                    continue
+                replacement = handler(m)
+                if replacement is None or replacement == m.group():
+                    continue
+                claimed.append((m.start(), m.end(), replacement))
+
+        if not claimed:
+            return text, notes
+        claimed.sort()
+        out, cursor = [], 0
+        for start, end, replacement in claimed:
+            out.append(text[cursor:start])
+            out.append(replacement)
+            cursor = end
+        out.append(text[cursor:])
+        return "".join(out), notes
 
     # START_CONTRACT: synthetic_address
     #   PURPOSE: Полная замена адресной строки. Делегирует Mapper: генератор
@@ -108,19 +137,22 @@ class TextSanitizer:
     #   OUTPUTS: { str - замена или исходник }
     #   SIDE_EFFECTS: none
     # END_CONTRACT: _checksummed
-    def _checksummed(self, raw: str) -> str:
+    def _checksummed(self, m: re.Match) -> str | None:
+        raw = m.group()
         d = normalize_digits(raw)
         if valid_snils(d):
-            return gen_snils(self.salt, d)
-        if valid_inn(d):
-            return gen_inn12(self.salt, d) if len(d) > 10 else gen_inn10(self.salt, d)
-        if valid_ogrn(d):
-            return gen_ogrn(self.salt, d, ip=len(d) == 15)
-        return raw
-
-    def _snils(self, raw: str) -> str:
-        d = normalize_digits(raw)
-        return gen_snils(self.salt, d) if valid_snils(d) else gen_digits_like(self.salt, raw)
+            fake = gen_snils(self.salt, d)
+        elif valid_inn(d):
+            fake = gen_inn12(self.salt, d) if len(d) > 10 else gen_inn10(self.salt, d)
+        elif valid_ogrn(d):
+            fake = gen_ogrn(self.salt, d, ip=len(d) == 15)
+        elif luhn_ok(d):
+            fake = gen_luhn_like(self.salt, d)      # номер карты
+        else:
+            return None                              # номер заявки, год, инвентарный
+        # Разделители исходника сохраняются: «123-456-789 64» -> «381-116-374 30».
+        # Заодно это делает замену непохожей на новый плоский идентификатор.
+        return _reshape(raw, fake)
 
     def _fio_initials(self, m: re.Match) -> str:
         fam, i1, i2 = self.mapper.initials(m.group(1), m.group(2), m.group(3))
@@ -178,6 +210,12 @@ class TextSanitizer:
         verdict = bool(self.llm(fragment))
         self.llm_cache[key] = verdict
         return verdict
+
+
+def _reshape(src: str, digits: str) -> str:
+    """Цифры замены раскладываются по позициям цифр исходника; разделители целы."""
+    it = iter(digits)
+    return "".join(next(it, "0") if ch.isdigit() else ch for ch in src)
 
 
 _SURNAME_RE = re.compile(r"(ов|ев|ин|ын|цк|ск)(а|у|е|ы|ым|ой|ая|ую|им|ом|ий|ого|ому)?$")
@@ -241,10 +279,10 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
         idxs = {order.index(c): f"{table}.{c}" for c in free_cols[table]}
         # ключ строки для примечаний берётся из плана, а не как первая колонка
         # файла: первой может стоять что угодно, вплоть до персональных данных
-        try:
-            pk_idx = order.index(plan.pk(table))
-        except ValueError:
-            pk_idx = 0
+        # Составной или отсутствующий ключ - отказ, а не «первая колонка».
+        # row_pk уезжает наружу внутри sanitization.notes: подставить туда
+        # первую попавшуюся колонку значит опубликовать её значение.
+        pk_idx = order.index(plan.pk(table))
         path = dump_dir / f"{dumpid}.dat.gz"
         rows_out, degraded = [], 0
         with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:

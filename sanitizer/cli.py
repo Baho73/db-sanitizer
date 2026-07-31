@@ -28,7 +28,7 @@ from pathlib import Path
 
 from sanitizer.corpus import build_corpora, corpus_limits, load_components, validate_corpus
 from sanitizer.mapper import Salt
-from sanitizer.policy import Plan
+from sanitizer.policy import Plan, validate_plan
 from sanitizer.runlog import RunLog
 
 DEF_COMPONENTS = "sanitizer/data/components-ru.json"
@@ -125,6 +125,18 @@ def cmd_run(a) -> int:
         for p in problems:
             print(f"  {p}")
         print("Дальше: почините компоненты корпуса и повторите run.")
+        return 1
+
+    # План проверяется ПЕРЕД исполнением, а не только при составлении: колонка,
+    # добавленная после аппрува, или план, отредактированный руками, иначе уехали
+    # бы в дамп сырыми - greenmask_config строит трансформации только по плану.
+    # §3.5 обещает «колонки нет в плане -> прогон не стартует»; вот это обещание.
+    errors = validate_plan(plan, snap)
+    if errors:
+        print("ПЛАН НЕ ПРИМЕНИМ К ТЕКУЩЕЙ СХЕМЕ (fail-closed):")
+        for e in errors:
+            print(f"  {e}")
+        print("Дальше: перепланируйте (sanitizer plan) и проведите план через гейт.")
         return 1
 
     rl = RunLog(work / "runlog.db")

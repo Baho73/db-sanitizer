@@ -97,8 +97,11 @@ def schema_fingerprint(snap: Snapshot) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-# Семантические типы, для которых генерация структурно инъективна (перестановка
-# Фейстеля или 40-битный суффикс). Только они допустимы на колонке-ключе.
+# Семантические типы, замена которых удерживает UNIQUE. Для ИНН/СНИЛС/ОГРН и
+# табельного это структурная инъективность (перестановка Фейстеля). Для email -
+# ВЕРОЯТНОСТНАЯ: 40-битный суффикс, коллизия становится заметной на сотнях тысяч
+# адресов (парадокс дней рождения). Ограничение записано в §6.2; смешивать эти
+# два вида гарантий в одном комментарии было неверно.
 _UNIQUE_SAFE = {SemType.INN, SemType.SNILS, SemType.OGRN, SemType.EMAIL,
                 SemType.PERSON_ID}
 
@@ -106,6 +109,14 @@ _UNIQUE_SAFE = {SemType.INN, SemType.SNILS, SemType.OGRN, SemType.EMAIL,
 # остальное он молча обнулял бы, а план выглядел бы корректным (разбор 5, находка 8).
 _JSON_FIELD_TYPES = {"phone", "fio_full", "snils", "inn", "email", "passport",
                      "person_id", "keep"}
+
+# Белые списки значений, а не только полей. Без них опечатка в override («fkae»)
+# проходила валидацию, а трансформер молча оставлял значение как есть: fail-open
+# через весь конвейер при зелёной валидации.
+_STRATEGIES = {"direct", "fake", "generate", "generalize", "shuffle", "keep",
+               "null", "freetext", "jsonb", "unresolved"}
+_LLM_MODES = {"direct", "corpus", "none"}
+_SEM_TYPES = {str(t) for t in SemType} | {"unknown"}
 
 
 
@@ -190,8 +201,10 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
         # нет, поэтому режим понижается явно, а не подменяется молча (находка 11).
         if strategy == "direct" and not llm_available:
             mode, reason = "none", "карта 1:1 из корпуса (LLM не настроена)"
-        if strategy == "generate" and st == SemType.EMAIL and not info.is_unique:
-            strategy, mode = "fake", "corpus"
+        # Понижения generate->fake для email больше нет: у fake нет ветки email,
+        # и значение уходило в корпус названий организаций - «ооо вектор» вместо
+        # адреса. Генерация email инъективна практически (40-битный суффикс),
+        # ограничение честно записано в §6.2; понижать её незачем.
         # Колонка-ключ с персональными данными (PRIMARY KEY (snils), UNIQUE (email)):
         # замена обязана остаться инъективной. Иначе UNIQUE падает на restore, а
         # «починка» дублей означает сохранение части исходных значений (находка 1).
@@ -249,6 +262,13 @@ def validate_plan(plan: Plan, snap: Snapshot) -> list[str]:
         missing = set(by_name) - set(plan.columns)
         errors.append(f"schema drift: fingerprint mismatch; columns not in plan: {sorted(missing)[:5]}")
     for name, pc in plan.columns.items():
+        if pc.strategy not in _STRATEGIES:
+            errors.append(f"{name}: неизвестная стратегия {pc.strategy!r}; "
+                          f"допустимы {sorted(_STRATEGIES)}")
+        if pc.llm_mode not in _LLM_MODES:
+            errors.append(f"{name}: неизвестный llm_mode {pc.llm_mode!r}")
+        if pc.sem_type not in _SEM_TYPES:
+            errors.append(f"{name}: неизвестный семантический тип {pc.sem_type!r}")
         if pc.strategy == "unresolved":
             errors.append(f"{name}: unresolved ({pc.reason})")
         if pc.strategy == "direct" and pc.sem_type in pii_str:
