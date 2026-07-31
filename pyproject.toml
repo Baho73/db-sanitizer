@@ -8,6 +8,9 @@ dependencies = [
     "psycopg[binary]>=3.1",
     "pyyaml>=6",
     "langgraph>=0.2",
+    # SqliteSaver (человеческий гейт между процессами) на langgraph 0.2.x -
+    # отдельный пакет; без него дефолтный путь CLI падает при pip-установке
+    "langgraph-checkpoint-sqlite>=1.0",
 ]
 
 [project.optional-dependencies]

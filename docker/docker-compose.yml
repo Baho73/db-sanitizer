@@ -26,7 +26,8 @@ services:
     profiles: ["tool"]
 
   demo-db:
-    image: postgres:17
+    # 17-trixie: мажор зафиксирован и совпадает с postgresql-client-17 в tool
+    image: postgres:17-trixie
     environment:
       POSTGRES_USER: demo
       POSTGRES_PASSWORD: demo
@@ -38,7 +39,7 @@ services:
       retries: 20
 
   staging-db:
-    image: postgres:17
+    image: postgres:17-trixie
     environment:
       POSTGRES_USER: staging
       POSTGRES_PASSWORD: staging
@@ -49,6 +50,6 @@ services:
       interval: 3s
       retries: 20
 
-# Сервис ollama убран: поставщика LLM в конвейере нет (см. docs/solution-design.md
-# §4.2, «отклонение: LLM»). Держать поднятый контейнер, к которому никто не
-# обращается, значит обещать механизм, которого не существует.
+# Сервис ollama в compose не входит сознательно: поставщик LLM - параметр среды
+# (LLM_* выше), а не часть стенда. Локальная модель на хосте доступна через
+# host.docker.internal; без неё конвейер идёт по кэшу голосов и словарям.
