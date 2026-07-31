@@ -41,6 +41,7 @@ class PlanState(TypedDict, total=False):
     auto_approve: bool      # CI-режим; пометка в отчёте
     overrides: dict         # решения человека по unresolved: колонка -> поля PlanColumn
     llm_available: bool     # настроен ли поставщик LLM; без него direct не назначается
+    params: dict            # пороги плана: кардинальность, разбираемость, max_degraded
     confirm: list[str]      # колонки, подтверждённые на гейте (null/generalize)
     confirmed_by: str       # human|ci - кто дал подтверждение
     snapshot_json: str
@@ -92,7 +93,8 @@ def _node_classify_and_assign(state: PlanState) -> dict:
     plan = assign(classified, snap,
                   sensitive_categories=set(state.get("sensitive_categories", [])),
                   json_map=state.get("json_map", {}),
-                  llm_available=bool(state.get("llm_available")))
+                  llm_available=bool(state.get("llm_available")),
+                  params=state.get("params"))
     # решения человека применяются ДО диффа и гейта: ревьюер видит итог,
     # а повторный прогон при неизменной схеме даёт пустой дифф
     apply_overrides(plan, state.get("overrides") or {})

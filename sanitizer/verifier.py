@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,7 +43,10 @@ class VerifyReport:
 
     @property
     def ok(self) -> bool:
-        return all(c.passed for c in self.checks if not c.skipped)
+        # Пропущенная проверка НЕ засчитывается пройденной: непроведённая проверка
+        # ничего не доказывает, а публикация решается по этому флагу. Метка ⏭
+        # остаётся, чтобы отличить «не проверяли» от «проверили и упало».
+        return all(c.passed for c in self.checks)
 
     def add(self, name: str, passed: bool, detail: str = "", skipped: bool = False):
         self.checks.append(Check(name, passed, detail, skipped))
@@ -78,15 +82,21 @@ _TEXTLIKE = ("character varying", "text", "jsonb")
 #   SIDE_EFFECTS: только чтение обеих БД
 # END_CONTRACT: verify
 def verify(src_dsn: str, dst_dsn: str, plan: Plan, canary_manifest: Path,
-           entropy_drop_max: float = 0.10, schema: str | None = None) -> VerifyReport:
+           entropy_drop_max: float = 0.10, schema: str | None = None,
+           corpus_sizes: dict[str, int] | None = None) -> VerifyReport:
     import psycopg
 
     manifest = json.loads(canary_manifest.read_text(encoding="utf-8"))
     canaries: dict[str, str] = manifest["values"]
     r = VerifyReport()
     # схема берётся из плана, а не зашита: вся правая половина V-модели иначе
-    # существует только для демонстрационной hr (разбор 4, находка 15)
-    schema = schema or sorted({q.split(".", 1)[0] for q in plan.columns})[0]
+    # существует только для демонстрационной hr (разбор 4, находка 15).
+    # План на несколько схем не проверяется молча по первой из них.
+    schemas = sorted({q.split(".", 1)[0] for q in plan.columns})
+    if schema is None:
+        if len(schemas) != 1:
+            raise ValueError(f"план охватывает схемы {schemas}; укажите проверяемую явно")
+        schema = schemas[0]
 
     with psycopg.connect(src_dsn) as src, psycopg.connect(dst_dsn) as dst:
         s, d = src.cursor(), dst.cursor()
@@ -128,30 +138,136 @@ def verify(src_dsn: str, dst_dsn: str, plan: Plan, canary_manifest: Path,
         r.add("Построчно fake(x) != x", not offenders,
               "; ".join(offenders) if offenders else "все direct/fake/generate чисты")
 
+        # 3b. Идентификаторы источника не встречаются в копии НИГДЕ - ни в
+        # структурных колонках, ни в свободном тексте. Проверка не зависит от
+        # канареек и от того, какие форматы умеет распознавать проход 2: она
+        # сравнивает КОНТРОЛЬНЫЕ СУММЫ. Именно её отсутствие позволило 783 СНИЛС
+        # уехать в копию при девяти зелёных проверках (разбор 5, находка 1).
+        leaked = _identifier_leak(s, d, plan, text_cols)
+        r.add("Идентификаторы источника отсутствуют в копии (по контрольным суммам)",
+              not leaked, "; ".join(leaked[:5]) if leaked else "ИНН/СНИЛС/ОГРН источника не найдены")
+
+        # 3c. Деградации прохода 2 - это фрагменты, оставленные без изменений.
+        # Их допустимое число объявляется планом и проходит гейт, а не молчит.
+        _degradation_check(r, d, plan)
+
         # 4. Ссылочная целостность: рестор прошёл с констрейнтами; сверяем их число
         s.execute(_FK_COUNT, (schema,))
         d.execute(_FK_COUNT, (schema,))
         src_fk, dst_fk = s.fetchone()[0], d.fetchone()[0]
         r.add("FK: все ограничения восстановлены", src_fk == dst_fk, f"{dst_fk}/{src_fk}")
 
-        # 5. Энтропия с исключениями по стратегиям (§5.4)
-        drops = []
+        # 5. Энтропия с исключениями по стратегиям (§5.4). Порог применяется к
+        # ДОСТИЖИМОМУ разнообразию: замена из корпуса размера m по хэшу даёт в
+        # среднем m·(1−e^(−n/m)) различных значений, и при n, сравнимом с m,
+        # просадка неизбежна физически. Требовать здесь исходную энтропию значит
+        # обещать разнообразие, которого корпус не содержит (разбор 5).
+        drops, capped = [], []
         for qualified, pc in plan.columns.items():
             if pc.strategy not in ("fake", "generate", "direct", "shuffle", "keep"):
                 continue  # generalize/null/freetext/jsonb - свои ожидания
             table, col = qualified.rsplit(".", 1)
             e_src = _col_entropy(s, table, col)
             e_dst = _col_entropy(d, table, col)
-            if e_src > 1.0 and e_dst < e_src * (1 - entropy_drop_max):
-                drops.append(f"{qualified}: {e_src:.2f}->{e_dst:.2f}")
-        r.add("Разнообразие: просадка энтропии <= 10%", not drops,
-              "; ".join(drops) if drops else "в пределах порога")
+            if e_src <= 1.0:
+                continue
+            limit = e_src
+            ceiling = _corpus_ceiling(pc, s, table, col, corpus_sizes)
+            if ceiling is not None and ceiling < e_src:
+                limit = ceiling
+                capped.append(f"{qualified} (потолок корпуса {ceiling:.2f})")
+            if e_dst < limit * (1 - entropy_drop_max):
+                drops.append(f"{qualified}: {e_src:.2f}->{e_dst:.2f} при пределе {limit:.2f}")
+        detail = "; ".join(drops) if drops else "в пределах порога"
+        if capped and not drops:
+            detail += f"; ограничено корпусом: {', '.join(capped)}"
+        r.add("Разнообразие: просадка энтропии <= 10% от достижимого", not drops, detail)
 
         # 6-7. Пробы сквозной консистентности задаются манифестом канареек, а не
         # зашиты в код: на чужой базе таблиц employees и tickets может не быть.
         _consistency_checks(r, d, manifest)
 
     return r
+
+
+_DIGIT_RUN_RE = re.compile(r"\d[\d\s-]{8,17}\d")
+
+
+def _corpus_ceiling(pc, s, table: str, col: str,
+                    corpus_sizes: dict[str, int] | None) -> float | None:
+    """Достижимая энтропия колонки со стратегией fake: сколько различных значений
+    в принципе может дать корпус при отображении n исходников хэшем в m ячеек."""
+    if pc.strategy != "fake" or not corpus_sizes:
+        return None
+    from sanitizer.corpus import SEM_TO_CORPUS
+
+    keys = SEM_TO_CORPUS.get(pc.sem_type, ())
+    sizes = [corpus_sizes[k] for k in keys if k in corpus_sizes]
+    if not sizes:
+        return None
+    m = min(sizes)
+    s.execute(f"SELECT count(DISTINCT {col}) FROM {table}")
+    n = s.fetchone()[0] or 0
+    if not n or not m:
+        return None
+    distinct = m * (1 - math.exp(-n / m))
+    return math.log2(max(distinct, 1))
+
+
+# START_CONTRACT: _identifier_leak
+#   PURPOSE: Найти в копии значения ИНН/СНИЛС/ОГРН источника, независимо от их
+#            написания. Опознание идёт по контрольной сумме, поэтому проверка не
+#            наследует слепоту того слоя, который она проверяет.
+#   INPUTS: { s: курсор источника, d: курсор копии, plan, text_cols }
+#   OUTPUTS: { list[str] - «таблица.колонка: сколько значений» }
+#   SIDE_EFFECTS: чтение обеих БД
+# END_CONTRACT: _identifier_leak
+def _identifier_leak(s, d, plan: Plan, text_cols: dict[str, list[str]]) -> list[str]:
+    from sanitizer.mapper import normalize_digits, valid_inn, valid_ogrn, valid_snils
+
+    wanted: set[str] = set()
+    for qualified, pc in plan.columns.items():
+        if pc.sem_type not in ("inn", "snils", "ogrn"):
+            continue
+        table, col = qualified.rsplit(".", 1)
+        s.execute(f"SELECT DISTINCT {col}::text FROM {table} WHERE {col} IS NOT NULL")
+        wanted |= {normalize_digits(r[0]) for r in s.fetchall()}
+    wanted = {w for w in wanted if valid_inn(w) or valid_snils(w) or valid_ogrn(w)}
+    if not wanted:
+        return []
+
+    found: list[str] = []
+    for table, cols in sorted(text_cols.items()):
+        for col in cols:
+            d.execute(f"SELECT {col}::text FROM {table} WHERE {col} IS NOT NULL")
+            hits = 0
+            for (value,) in d.fetchall():
+                for run in _DIGIT_RUN_RE.findall(value):
+                    if normalize_digits(run) in wanted:
+                        hits += 1
+            if hits:
+                found.append(f"{table}.{col}: {hits}")
+    return found
+
+
+def _degradation_check(r: VerifyReport, d, plan: Plan):
+    """Проход 2 фиксирует деградации в sanitization.summary. Порог - решение
+    человека, объявленное в плане; молчаливое умолчание здесь означало бы, что
+    неразобранный фрагмент уезжает в копию без единого следа."""
+    allowed = plan.params.get("max_degraded")
+    try:
+        d.execute("SELECT coalesce(sum(degraded), 0) FROM sanitization.summary")
+        total = d.fetchone()[0]
+    except Exception:
+        r.add("Деградации прохода 2 в пределах объявленного порога", False,
+              "схемы sanitization нет в копии - проход 2 не отчитался", skipped=True)
+        return
+    if allowed is None:
+        r.add("Деградации прохода 2 в пределах объявленного порога", False,
+              f"деградаций {total}, порог max_degraded в плане не объявлен")
+        return
+    r.add("Деградации прохода 2 в пределах объявленного порога", total <= allowed,
+          f"{total} <= {allowed}" if total <= allowed else f"{total} > {allowed}")
 
 
 # START_CONTRACT: _consistency_checks
@@ -194,6 +310,9 @@ def _consistency_checks(r: VerifyReport, cur, manifest: dict):
     # пережить санитизацию без изменений. Порчу экранированием не ловила ни одна
     # из восьми проверок - она вылезала уже на стороне потребителя копии.
     broken = []
+    if not probes.get("preserved"):
+        r.add("Текст не испорчен: не-ПДн фрагменты сохранены дословно", False,
+              "проба не описана в манифесте канареек", skipped=True)
     for probe in probes.get("preserved", []):
         cur.execute(f"SELECT {probe['column']} FROM {probe['table']} "
                     f"WHERE {probe['key_column']} = %s", (probe["key"],))

@@ -8,8 +8,10 @@ services:
       staging-db: {condition: service_healthy}
     volumes: ["../out:/app/out"]
     environment:
-      # соль демо-прогона; у инструмента нет умолчания намеренно
-      MASTER_SALT: ${MASTER_SALT:-dev-master}
+      # Соль обязана быть задана снаружи. Умолчания нет ни в инструменте, ни
+      # здесь: демо на публично известной соли выглядело бы как рабочий прогон.
+      # Makefile задаёт для демонстрации значение с говорящим именем.
+      MASTER_SALT: ${MASTER_SALT:?задайте MASTER_SALT (для демо см. Makefile)}
       RECIPIENT: ${RECIPIENT:-dev}
       GENERATION: ${GENERATION:-g1}
     profiles: ["tool"]

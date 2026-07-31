@@ -22,11 +22,17 @@ except Exception:
 
 pytestmark = pytest.mark.skipif(not DB_UP, reason="нужны обе БД с прогнанной санитизацией")
 
+from sanitizer.corpus import build_corpora, load_components  # noqa: E402
 from sanitizer.policy import Plan  # noqa: E402
 from sanitizer.verifier import column_checksums, entropy, verify  # noqa: E402
 
 PLAN = Path("out/sanitization-plan.yaml")
 CANARIES = Path("out/canaries.json")
+# Размеры корпусов нужны верификатору, чтобы сравнивать разнообразие копии с
+# ДОСТИЖИМЫМ, а не с исходным: корпус меньше числа исходных значений физически
+# не может дать ту же энтропию (разбор 5).
+CORPUS_SIZES = {k: len(v) for k, v in
+                build_corpora(load_components(Path("sanitizer/data/components-ru.json"))).items()}
 
 
 @pytest.fixture(scope="module")
@@ -37,7 +43,7 @@ def plan():
 
 
 def test_clean_copy_passes(plan):
-    r = verify(SRC, DST, plan, CANARIES)
+    r = verify(SRC, DST, plan, CANARIES, corpus_sizes=CORPUS_SIZES)
     failed = [c.name for c in r.checks if not c.passed]
     assert r.ok, f"провалены: {failed}"
     assert len(r.checks) >= 8
@@ -51,7 +57,7 @@ def test_planted_canary_leak_is_caught(plan):
                      (" " + canary,))
         conn.commit()
     try:
-        r = verify(SRC, DST, plan, CANARIES)
+        r = verify(SRC, DST, plan, CANARIES, corpus_sizes=CORPUS_SIZES)
         assert not r.ok, "верификатор пропустил подсаженную канарейку"
         assert any("Канарейки в копии" in c.name and not c.passed for c in r.checks)
     finally:
@@ -69,7 +75,7 @@ def test_planted_identity_leak_is_caught(plan):
         d.execute("UPDATE hr.employees SET inn = %s WHERE id = 1", (orig,))
         d.commit()
     try:
-        r = verify(SRC, DST, plan, CANARIES)
+        r = verify(SRC, DST, plan, CANARIES, corpus_sizes=CORPUS_SIZES)
         assert not r.ok, "верификатор пропустил неизменённое исходное значение"
         assert any("fake(x)" in c.name and not c.passed for c in r.checks)
     finally:
@@ -86,7 +92,7 @@ def test_row_count_mismatch_is_caught(plan):
         d.execute("DELETE FROM hr.audit_log WHERE id = %s", (row[0],))
         d.commit()
     try:
-        r = verify(SRC, DST, plan, CANARIES)
+        r = verify(SRC, DST, plan, CANARIES, corpus_sizes=CORPUS_SIZES)
         assert not r.ok
         assert any("Объём" in c.name and not c.passed for c in r.checks)
     finally:

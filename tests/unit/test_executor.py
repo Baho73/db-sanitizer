@@ -33,7 +33,7 @@ def make_plan(tmp_path: Path) -> Plan:
     (art / "direct.hr.e.org.json").write_text(
         json.dumps({"ООО Ромашка": "ООО ВЕКТОР-ПРИМ"}, ensure_ascii=False), encoding="utf-8")
     (art / "shuffle.hr.e.salary.json").write_text(json.dumps({"1": "99999", "2": "11111"}), encoding="utf-8")
-    return Plan(1, "fp", cols, [], [], {})
+    return Plan(1, "fp", cols, [], [], {}, {"hr.e": ["id"]})
 
 
 def row(**kv):
@@ -99,6 +99,22 @@ def test_greenmask_config_shape(tmp_path):
     names = [c["name"] for c in params["columns"]]
     assert "id" in names and "note_text" not in names      # freetext не в проходе 1
     assert params["columns"][0] == {"name": "id", "not_affected": True}
+    assert params["args"][params["args"].index("--pk") + 1] == "id"
+
+
+def test_greenmask_config_uses_real_key_not_named_id(tmp_path):
+    """Разбор 5, находка 9: ключ брался как колонка «id». На таблице с другим
+    именем ключа конфиг запрашивал несуществующую колонку."""
+    plan = Plan(1, "fp", {
+        "hr.pay.pay_no": PlanColumn("technical", "keep", "none", "pk"),
+        "hr.pay.holder": PlanColumn("family", "fake", "corpus", "x"),
+    }, [], [], {}, {"hr.pay": ["pay_no"]})
+    cfg = greenmask_config(plan, "postgresql://x", tmp_path / "d", tmp_path / "p.yaml",
+                           tmp_path / "art")
+    params = cfg["dump"]["transformation"][0]["transformers"][0]["params"]
+    assert params["columns"][0] == {"name": "pay_no", "not_affected": True}
+    assert "id" not in [c["name"] for c in params["columns"]]
+    assert params["args"][params["args"].index("--pk") + 1] == "pay_no"
 
 
 def test_runlog_publish_gate(tmp_path):

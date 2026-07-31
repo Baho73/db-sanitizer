@@ -116,6 +116,47 @@ def test_jsonb_snils_is_replaced_not_blanked(tmp_path):
     assert got["snils"] != src["snils"] and valid_snils(got["snils"].replace("-", "").replace(" ", ""))
 
 
+# --- разбор 5, находка 1: идентификатор опознаётся КС, а не пунктуацией ---
+
+def _ts(tmp_path) -> TextSanitizer:
+    return TextSanitizer(_t(tmp_path).mapper, S, frozenset())
+
+
+@pytest.mark.parametrize("shape", ["{}", "СНИЛС {} в личном деле", "({})", "№{}."])
+def test_snils_without_separators_is_replaced(tmp_path, shape):
+    from sanitizer.mapper import gen_snils
+
+    src = gen_snils(S, "victim")            # 11 цифр подряд, как в реальной базе
+    assert valid_snils(src) and "-" not in src
+    out, _ = _ts(tmp_path).sanitize_text(shape.format(src))
+    assert src not in out
+
+
+def test_inn_and_ogrn_in_text_replaced_regardless_of_shape(tmp_path):
+    from sanitizer.mapper import gen_inn10, gen_ogrn, valid_inn, valid_ogrn
+
+    inn10, ogrn = gen_inn10(S, "org"), gen_ogrn(S, "org")
+    out, _ = _ts(tmp_path).sanitize_text(f"договор с ИНН {inn10}, ОГРН {ogrn}")
+    assert inn10 not in out and ogrn not in out
+    digits = [w for w in out.replace(",", " ").split() if w.isdigit()]
+    assert any(valid_inn(x) for x in digits) and any(valid_ogrn(x) for x in digits)
+
+
+def test_number_without_checksum_is_left_alone(tmp_path):
+    """Номер заявки и год выпуска станка персональными данными не являются."""
+    text = "заявка 1234567890 от станка 000000000001"
+    out, _ = _ts(tmp_path).sanitize_text(text)
+    assert out == text
+
+
+def test_phone_not_double_replaced_as_identifier(tmp_path):
+    """Телефон заменяется первым эшелоном; повторная замена сломала бы
+    консистентность одного номера в тексте и в колонке."""
+    ts = _ts(tmp_path)
+    out, _ = ts.sanitize_text("тел 89161234567")
+    assert ts.mapper.phone("89161234567") in out
+
+
 # --- паспорт стал инъективным ---
 
 def test_passport_generation_is_injective():

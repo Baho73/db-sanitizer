@@ -11,5 +11,9 @@
     "hr.payroll.amount": {"strategy": "shuffle", "reason": "human: как salary"}
   },
   "confirm": ["hr.employees.birth_date"],
+  "params": {
+    "max_degraded": 120,
+    "_max_degraded_note": "Решение человека: столько фрагментов свободного текста допускается оставить неразобранными. Каждый помечен в sanitization.notes; без объявленного порога верификация не проходит."
+  },
   "note": "overrides - разметка колонок; confirm - подтверждение необратимых стратегий (null/generalize). В интерактивном режиме confirm вводится на гейте и помечается human, в --auto-approve берётся отсюда и помечается ci."
 }

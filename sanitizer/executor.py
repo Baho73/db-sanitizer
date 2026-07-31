@@ -61,10 +61,14 @@ def prepare_artifacts(plan: Plan, dsn: str, salt: Salt, corpora: dict[str, list[
                     for v in sorted(values):
                         base = mapper.pick("org", v.lower(), avoid=v).upper()[:150]
                         fake = base
-                        i = 0
-                        while fake in used:
-                            i += 1
+                        for i in range(1, 998):     # суффикс по модулю 997
+                            if fake not in used:
+                                break
                             fake = f"{base}-{(_h(salt, 'direct', v) + i) % 997}"
+                        if fake in used:            # раньше здесь был вечный цикл
+                            raise ValueError(
+                                f"{qualified}: корпус исчерпан на значении {v!r}. "
+                                f"Дальше: расширьте корпус org либо смените стратегию.")
                         used.add(fake)
                         mapping[v] = fake
                 p = out_dir / f"direct.{table}.{col}.json"
@@ -82,21 +86,12 @@ def prepare_artifacts(plan: Plan, dsn: str, salt: Salt, corpora: dict[str, list[
     return written
 
 
-def _single_pk(cur, table: str) -> str:
-    schema, name = table.split(".", 1)
-    cur.execute(
-        "SELECT kcu.column_name FROM information_schema.table_constraints tc "
-        "JOIN information_schema.key_column_usage kcu "
-        "  ON kcu.constraint_name = tc.constraint_name "
-        " AND kcu.table_schema = tc.table_schema AND kcu.table_name = tc.table_name "
-        "WHERE tc.table_schema = %s AND tc.table_name = %s "
-        "  AND tc.constraint_type = 'PRIMARY KEY'", (schema, name))
-    cols = [r[0] for r in cur.fetchall()]
-    if len(cols) != 1:
-        raise ValueError(
-            f"{table}: перемешивание требует одноколоночного первичного ключа, "
-            f"найдено {cols}. Дальше: выберите для колонки другую стратегию.")
-    return cols[0]
+def _single_pk(plan: Plan, table: str) -> str:
+    try:
+        return plan.pk(table)
+    except ValueError as e:
+        raise ValueError(f"{e}. Перемешивание требует одноколоночного ключа; "
+                         f"дальше: выберите для колонки другую стратегию.") from e
 
 
 def _entity_column(plan: Plan, table: str, pk: str) -> tuple[str, str]:
@@ -135,7 +130,7 @@ def _group_permutations(cur, plan: Plan, salt: Salt) -> dict:
         if pc.strategy != "shuffle":
             continue
         table = qualified.rsplit(".", 1)[0]
-        entity, group = _entity_column(plan, table, _single_pk(cur, table))
+        entity, group = _entity_column(plan, table, _single_pk(plan, table))
         members.setdefault(group, {})[table] = entity
 
     out: dict[str, dict] = {}
@@ -153,7 +148,10 @@ def _group_permutations(cur, plan: Plan, salt: Salt) -> dict:
 def _induced(perm: dict[str, str], present: set[str], e: str) -> str:
     """Перестановка группы, суженная на сущности одной таблицы: идём по циклу,
     пока не попадём в имеющиеся. Сужение перестановки на подмножество остаётся
-    перестановкой, поэтому мультимножество значений колонки сохраняется точно."""
+    перестановкой сущностей. Мультимножество ЗНАЧЕНИЙ сохраняется точно, только
+    когда у всех сущностей таблицы одинаковое число строк: иначе донорские строки
+    берутся по кругу, часть значений дублируется, часть теряется. Для таблицы
+    «одна строка на сущность» и для регулярных начислений условие выполняется."""
     seen = 0
     cur_e = perm.get(e, e)
     while cur_e not in present and seen < len(perm):
@@ -172,7 +170,7 @@ def _induced(perm: dict[str, str], present: set[str], e: str) -> str:
 #   SIDE_EFFECTS: чтение источника
 # END_CONTRACT: _shuffle_map
 def _shuffle_map(cur, plan: Plan, table: str, col: str, perms: dict) -> dict[str, str]:
-    pk = _single_pk(cur, table)
+    pk = _single_pk(plan, table)
     entity, group = _entity_column(plan, table, pk)
     perm = perms[group]["perm"]
     cur.execute(f"SELECT {pk}::text, {entity}::text, {col}::text FROM {table} "
@@ -216,7 +214,10 @@ def greenmask_config(plan: Plan, src_dsn: str, dump_dir: Path, plan_path: Path,
     transformations = []
     for table, cols in sorted(tables.items()):
         schema, name = table.split(".")
-        columns = [{"name": "id", "not_affected": True}] if "id" not in cols else []
+        # Первичный ключ берётся из плана, а не угадывается по имени «id»:
+        # он нужен трансформеру для подстановки предвычисленной перестановки.
+        pk = plan.pk(table)
+        columns = [{"name": pk, "not_affected": True}] if pk not in cols else []
         columns += [{"name": c} for c in sorted(cols)]
         transformations.append({
             "schema": schema, "name": name,
@@ -226,7 +227,7 @@ def greenmask_config(plan: Plan, src_dsn: str, dump_dir: Path, plan_path: Path,
                     "executable": "python",
                     "args": ["-m", "sanitizer.cmd_transformer",
                              "--plan", str(plan_path), "--table", table,
-                             "--artifacts", str(artifacts_dir)],
+                             "--pk", pk, "--artifacts", str(artifacts_dir)],
                     "driver": {"name": "json"},
                     "timeout": "600s",
                     "expected_exit_code": 0,

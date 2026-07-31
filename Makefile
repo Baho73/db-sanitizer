@@ -1,4 +1,8 @@
 # Демо-цикл db-sanitizer. Запуск: make demo (из чистого клона).
+# Соль демонстрации задаётся здесь и только здесь: у инструмента и у compose
+# умолчания нет. Имя выбрано говорящим - прогон на ней не является рабочим.
+export MASTER_SALT ?= demo-salt-not-a-secret
+
 COMPOSE = docker compose -f docker/docker-compose.yml
 TOOL = $(COMPOSE) run --rm tool
 

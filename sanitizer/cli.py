@@ -43,8 +43,9 @@ def _salt() -> Salt:
     if not master:
         raise SystemExit(
             "MASTER_SALT не задан. Соль - единственный секрет инструмента: без неё "
-            "замены воспроизводит кто угодно.\nДальше: экспортируйте MASTER_SALT "
-            "(для демо достаточно MASTER_SALT=dev-master), затем повторите команду.")
+            "замены воспроизводит кто угодно.\nДальше: возьмите значение из "
+            "секрет-стора и экспортируйте MASTER_SALT, затем повторите команду. "
+            "Подсказывать значение здесь нельзя: подсказанная соль перестаёт быть секретом.")
     return Salt(master=master.encode(),
                 recipient=os.environ.get("RECIPIENT", "dev"),
                 generation=os.environ.get("GENERATION", "g1"),
@@ -69,6 +70,7 @@ def cmd_plan(a) -> int:
              "sensitive_categories": cfg.get("sensitive_categories", []),
              "overrides": cfg.get("overrides", {}),
              "confirm": cfg.get("confirm", []),
+             "params": cfg.get("params", {}),
              "plan_path": a.plan, "auto_approve": a.auto_approve}
     try:
         out = run_planning(build_graph(), state)
@@ -198,7 +200,9 @@ def cmd_verify(a) -> int:
                "recipient_id": _salt().recipient, "corpus_version": "fixtures-1",
                "cache_version": "none", "tool_version": "0.1.0"}
     rl.mark("verify", "*", "running")
-    report = verify(a.src_dsn, a.dst_dsn, plan, Path(a.canaries))
+    corpora = build_corpora(load_components(Path(a.components)))
+    report = verify(a.src_dsn, a.dst_dsn, plan, Path(a.canaries),
+                    corpus_sizes={k: len(v) for k, v in corpora.items()})
     md = render_markdown(report)
     Path(a.report).write_text(md, encoding="utf-8")
     checks = column_checksums(a.dst_dsn, plan)
@@ -305,6 +309,7 @@ def main() -> int:
     p.add_argument("--plan", default="out/sanitization-plan.yaml")
     p.add_argument("--canaries", default="out/canaries.json")
     p.add_argument("--work", default="out")
+    p.add_argument("--components", default=DEF_COMPONENTS)
     p.add_argument("--report", default="out/verify-report.md")
     p.set_defaults(fn=cmd_verify)
 

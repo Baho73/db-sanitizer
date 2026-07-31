@@ -45,7 +45,10 @@ class PlanColumn:
     confirmed: bool = False  # обязателен для null/generalize; проставляется ТОЛЬКО на гейте
     confirmed_by: str = ""   # human|ci - кто подтвердил; пусто = не подтверждено
     json_fields: dict[str, str] = field(default_factory=dict)
-    length_policy: str = "fail"  # truncate|widen|fail - для freetext (§5.5)
+    # truncate|fail - для freetext (§5.5). Значения widen нет: расширение колонки
+    # пришлось бы применять ДО pg_restore, а sanitization.sql едет после него -
+    # то есть политика была неисполнима по построению (разбор 5, находка 6).
+    length_policy: str = "fail"
 
 
 @dataclass
@@ -56,10 +59,15 @@ class Plan:
     classes: list[list[str]]
     soft_links_pending: list[list[str]]
     params: dict
+    # Первичные ключи таблиц едут в плане: исполнение работает по плану, а не по
+    # догадке «колонка называется id». Без этого конвейер собирался только там,
+    # где ключ действительно назван id (разбор 5, находка 9).
+    primary_keys: dict[str, list[str]] = field(default_factory=dict)
 
     def dump(self, path: Path):
         data = {"version": self.version, "schema_fingerprint": self.schema_fingerprint,
                 "params": self.params, "classes": self.classes,
+                "primary_keys": self.primary_keys,
                 "soft_links_pending": self.soft_links_pending,
                 "columns": {k: asdict(v) for k, v in sorted(self.columns.items())}}
         path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -69,7 +77,15 @@ class Plan:
         d = yaml.safe_load(path.read_text(encoding="utf-8"))
         return Plan(d["version"], d["schema_fingerprint"],
                     {k: PlanColumn(**v) for k, v in d["columns"].items()},
-                    d["classes"], d["soft_links_pending"], d["params"])
+                    d["classes"], d["soft_links_pending"], d["params"],
+                    d.get("primary_keys", {}))
+
+    def pk(self, table: str) -> str:
+        """Единственная колонка первичного ключа таблицы либо ошибка с именем."""
+        cols = self.primary_keys.get(table) or []
+        if len(cols) != 1:
+            raise ValueError(f"{table}: ожидался одноколоночный первичный ключ, в плане {cols}")
+        return cols[0]
 
 
 def schema_fingerprint(snap: Snapshot) -> str:
@@ -85,6 +101,11 @@ def schema_fingerprint(snap: Snapshot) -> str:
 # Фейстеля или 40-битный суффикс). Только они допустимы на колонке-ключе.
 _UNIQUE_SAFE = {SemType.INN, SemType.SNILS, SemType.OGRN, SemType.EMAIL,
                 SemType.PERSON_ID}
+
+# Типы разметки ключей jsonb, которые трансформер действительно умеет. Всё
+# остальное он молча обнулял бы, а план выглядел бы корректным (разбор 5, находка 8).
+_JSON_FIELD_TYPES = {"phone", "fio_full", "snils", "inn", "email", "passport",
+                     "person_id", "keep"}
 
 
 
@@ -155,8 +176,12 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
             strategy, mode, reason = "shuffle", "none", "sensitive-category"
         if strategy == "fake" and info.cardinality < p["fake_min_cardinality"] and st not in PII_TYPES:
             strategy, reason = "keep", f"low-card {info.cardinality}"          # §5.6
+        # ПДн малой кардинальности: замена из корпуса восстановима частотой.
+        # Раньше здесь стоял `pass` с комментарием «валидация потребует решения»,
+        # а валидация проверяла только категориальные типы - ветка была мёртвой
+        # и вводила в заблуждение (разбор 5, находка 11).
         if strategy == "fake" and info.cardinality < p["fake_min_cardinality"] and st in PII_TYPES:
-            pass  # ПДн малой кардинальности: fake запрещён - валидация потребует решения
+            reason = f"{reason}; ПДн при кардинальности {info.cardinality}"
         if strategy == "direct" and (st in PII_TYPES or info.cardinality > p["direct_threshold"]):
             strategy, mode, reason = "fake", "corpus", "direct-forbidden"      # §3.1
         # Стратегия direct - это МАТЕРИАЛИЗОВАННАЯ карта 1:1 (инъективная по
@@ -198,7 +223,11 @@ def assign(classified: list[ClassifiedColumn], snap: Snapshot,
             for c in members:
                 if cols[c].strategy == "keep" and cols[c].sem_type != str(SemType.TECHNICAL):
                     cols[c].strategy = s
-    return Plan(1, schema_fingerprint(snap), cols, classes, [], p)
+    pks: dict[str, list[str]] = {}
+    for c in snap.columns:
+        if c.is_pk:
+            pks.setdefault(c.table, []).append(c.name)
+    return Plan(1, schema_fingerprint(snap), cols, classes, [], p, pks)
 
 
 
@@ -228,6 +257,13 @@ def validate_plan(plan: Plan, snap: Snapshot) -> list[str]:
             errors.append(f"{name}: llm_mode direct без настроенной LLM - механизма замены нет")
         if pc.strategy in ("null", "generalize") and not (pc.confirmed and pc.confirmed_by):
             errors.append(f"{name}: strategy {pc.strategy} requires human confirmation")
+        if pc.length_policy not in ("truncate", "fail"):
+            errors.append(f"{name}: length_policy {pc.length_policy!r} не реализована; "
+                          f"допустимы truncate и fail")
+        bad_json = sorted(set(pc.json_fields.values()) - _JSON_FIELD_TYPES)
+        if bad_json:
+            errors.append(f"{name}: разметка jsonb {bad_json} не поддерживается - "
+                          f"такие ключи молча обнулялись бы")
         info = by_name.get(name)
         if info is not None and (info.is_pk or info.is_unique) and pc.sem_type in pii_str \
                 and pc.strategy not in ("generate", "unresolved"):

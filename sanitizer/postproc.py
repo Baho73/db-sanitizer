@@ -26,8 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from sanitizer.mapper import (
-    Mapper, Salt, gen_digits_like, gen_inn10, gen_inn12, gen_snils, normalize_digits,
-    valid_inn, valid_snils,
+    Mapper, Salt, gen_digits_like, gen_inn10, gen_inn12, gen_ogrn, gen_snils,
+    normalize_digits, valid_inn, valid_ogrn, valid_snils,
 )
 from sanitizer.policy import Plan
 
@@ -36,7 +36,12 @@ from sanitizer.policy import Plan
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}(?!\d)")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-zа-я]{2,}")
 _SNILS_RE = re.compile(r"(?<!\d)\d{3}-\d{3}-\d{3}[\s-]?\d{2}(?!\d)")
-_INN_RE = re.compile(r"(?<!\d)\d{10}(?:\d{2})?(?!\d)")
+# Идентификатор в тексте опознаётся КОНТРОЛЬНОЙ СУММОЙ, а не пунктуацией.
+# Прежние шаблоны ловили СНИЛС только с дефисами и ИНН только в 10/12 знаков;
+# база пишет СНИЛС подряд («09085653089»), и 783 таких значения доехали до
+# копии - мимо всех девяти проверок верификатора (разбор 5, находка 1).
+# Лидирующий «+» исключён: телефоны к этому моменту уже заменены.
+_ID_RUN_RE = re.compile(r"(?<![+\d-])\d{10,15}(?![\d-])")
 _PASSPORT_RE = re.compile(r"(?<!\d)\d{4}\s\d{6}(?!\d)")
 # ФИО: «Фамилия И.О.», «Фамилия Имя (Отчество)» - словарь имён + фамильные суффиксы
 _FIO_INITIALS_RE = re.compile(r"\b([А-ЯЁ][а-яё]+(?:ов|ев|ин|ын|ова|ева|ина|ына|ский|ская|цкий|цкая|ко|ук|юк)а?)\s+([А-ЯЁ])\.\s?([А-ЯЁ])\.")
@@ -76,10 +81,10 @@ class TextSanitizer:
         out = _EMAIL_RE.sub(lambda m: self.mapper.email(m.group()), out)
         out = _SNILS_RE.sub(lambda m: self._snils(m.group()), out)
         out = _PASSPORT_RE.sub(lambda m: gen_digits_like(self.salt, m.group()), out)
-        # ИНН в тексте заменяется ТЕМ ЖЕ генератором, что и структурная колонка:
-        # иначе один ИНН получает две разные замены, и склейка «ООО X, ИНН ...»
-        # перестаёт сходиться с таблицей контрагентов
-        out = _INN_RE.sub(lambda m: self._inn(m.group()), out)
+        # Идентификаторы заменяются ТЕМИ ЖЕ генераторами, что и структурные
+        # колонки: иначе один ИНН получает две разные замены, и склейка
+        # «ООО X, ИНН ...» перестаёт сходиться с таблицей контрагентов
+        out = _ID_RUN_RE.sub(lambda m: self._checksummed(m.group()), out)
         out = _FIO_INITIALS_RE.sub(lambda m: self._fio_initials(m), out)
         out = _CAP_PAIR_RE.sub(lambda m: self._cap_pair(m, notes, aggressive), out)
         return out, notes
@@ -95,11 +100,23 @@ class TextSanitizer:
     def synthetic_address(self, raw: str) -> str:
         return self.mapper.synthetic_address(raw)
 
-    def _inn(self, raw: str) -> str:
+    # START_CONTRACT: _checksummed
+    #   PURPOSE: Цифровая последовательность -> замена, если её контрольная сумма
+    #            опознаёт ИНН, СНИЛС или ОГРН. Число без валидной КС не трогается:
+    #            номер заявки и год выпуска станка персональными данными не являются.
+    #   INPUTS: { raw: str - последовательность из 10-15 цифр }
+    #   OUTPUTS: { str - замена или исходник }
+    #   SIDE_EFFECTS: none
+    # END_CONTRACT: _checksummed
+    def _checksummed(self, raw: str) -> str:
         d = normalize_digits(raw)
-        if not valid_inn(d):
-            return raw
-        return gen_inn12(self.salt, d) if len(d) > 10 else gen_inn10(self.salt, d)
+        if valid_snils(d):
+            return gen_snils(self.salt, d)
+        if valid_inn(d):
+            return gen_inn12(self.salt, d) if len(d) > 10 else gen_inn10(self.salt, d)
+        if valid_ogrn(d):
+            return gen_ogrn(self.salt, d, ip=len(d) == 15)
+        return raw
 
     def _snils(self, raw: str) -> str:
         d = normalize_digits(raw)
@@ -213,7 +230,6 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
             length_policy[qualified] = pc.length_policy
 
     limits = max_len or {}
-    widen: dict[str, int] = {}
     notes_rows: list[tuple] = []
     summary: dict = {}
     for dumpid, table in toc_tables(dump_dir, pg_restore).items():
@@ -223,6 +239,12 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
             runlog.mark("pass2", table, "running")
         order = columns_order[table]
         idxs = {order.index(c): f"{table}.{c}" for c in free_cols[table]}
+        # ключ строки для примечаний берётся из плана, а не как первая колонка
+        # файла: первой может стоять что угодно, вплоть до персональных данных
+        try:
+            pk_idx = order.index(plan.pk(table))
+        except ValueError:
+            pk_idx = 0
         path = dump_dir / f"{dumpid}.dat.gz"
         rows_out, degraded = [], 0
         with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
@@ -234,7 +256,7 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
                 if len(fields) < len(order):   # хвост файла / служебные строки
                     rows_out.append(line)
                     continue
-                pk = fields[0]
+                pk = fields[pk_idx]
                 for i, qualified in idxs.items():
                     if fields[i] == "\\N":
                         continue
@@ -249,13 +271,12 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
                         if policy == "truncate":
                             new = new[:limit]
                             notes = notes + ["truncated_to_column_length"]
-                        elif policy == "widen":
-                            widen[qualified] = max(widen.get(qualified, 0), len(new))
                         else:
                             raise ValueError(
                                 f"{qualified}: замена длиной {len(new)} не влезает в "
-                                f"{limit}; length_policy=fail. Дальше: выберите "
-                                f"truncate или widen в плане для этой колонки.")
+                                f"{limit}; length_policy=fail. Дальше: поставьте "
+                                f"truncate в плане для этой колонки либо расширьте "
+                                f"колонку в staging до прогона restore.")
                     fields[i] = _copy_escape(new)
                     for code in notes:
                         degraded += 1
@@ -267,7 +288,7 @@ def process_dump(dump_dir: Path, plan: Plan, columns_order: dict[str, list[str]]
         if runlog:
             runlog.mark("pass2", table, "done")
 
-    _write_sanitization_sql(dump_dir, notes_rows, summary, widen)
+    _write_sanitization_sql(dump_dir, notes_rows, summary)
     return summary
 
 
@@ -300,8 +321,7 @@ def _q(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def _write_sanitization_sql(dump_dir: Path, notes: list[tuple], summary: dict,
-                            widen: dict[str, int] | None = None):
+def _write_sanitization_sql(dump_dir: Path, notes: list[tuple], summary: dict):
     """Примечания §5.7.1 внутри каталога дампа; применяются командой restore.
     Скрипт идемпотентен: restore на непустую staging повторяется без ошибок."""
     lines = [
@@ -312,9 +332,6 @@ def _write_sanitization_sql(dump_dir: Path, notes: list[tuple], summary: dict,
         "(table_name text, rows int, degraded int);",
         "TRUNCATE sanitization.notes; TRUNCATE sanitization.summary;",
     ]
-    for qualified, length in sorted((widen or {}).items()):
-        table, col = qualified.rsplit(".", 1)
-        lines.append(f"ALTER TABLE {table} ALTER COLUMN {col} TYPE varchar({length});")
     if len(notes) <= 10_000:  # построчно только меньшинство (§5.7.1 п.3)
         for t, pk, col, code in notes:
             lines.append("INSERT INTO sanitization.notes VALUES "

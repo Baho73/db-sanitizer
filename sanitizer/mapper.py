@@ -325,7 +325,10 @@ def gen_int_like(salt: Salt, src: str) -> int:
     digits = normalize_digits(src) or "0"
     n = len(digits)
     if n < 2:
-        return int(digits)  # однозначные оставляем: перестановки на 10 значениях мало
+        # однозначные: перестановка десяти цифр, порождённая солью. Возврат
+        # исходника был бы тождественной заменой, то есть утечкой значения.
+        order = sorted(range(10), key=lambda d: _h(salt, "int1", str(d)))
+        return order[int(digits)]
     lo = 10 ** (n - 1)
     y = int(digits)
     label = f"int{n}"
