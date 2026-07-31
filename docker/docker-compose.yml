@@ -14,6 +14,15 @@ services:
       MASTER_SALT: ${MASTER_SALT:?задайте MASTER_SALT (для демо см. Makefile)}
       RECIPIENT: ${RECIPIENT:-dev}
       GENERATION: ${GENERATION:-g1}
+      # Поставщик модели опционален: без него конвейер идёт по кэшу голосов и
+      # поставляемым словарям. Для локальной Ollama на хосте:
+      #   LLM_PROVIDER=ollama LLM_BASE_URL=http://host.docker.internal:11434
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-300}
+    extra_hosts: ["host.docker.internal:host-gateway"]
     profiles: ["tool"]
 
   demo-db:

@@ -140,11 +140,21 @@ def cmd_run(a) -> int:
     from sanitizer.mapper import Mapper
     from sanitizer.profiler import profile
 
+    from sanitizer import llm as llm_mod
+
     plan = Plan.load(Path(a.plan))
     salt = _salt()
-    corpora = build_corpora(load_components(Path(a.components)))
     work = Path(a.work)
     work.mkdir(parents=True, exist_ok=True)
+
+    # Поставщик модели опционален во всех трёх ролях исполнения. Его отсутствие -
+    # не ошибка: конвейер обязан отрабатывать по кэшу и словарям, иначе
+    # проверяющий не сможет повторить прогон без своей модели.
+    client = llm_mod.from_env()
+    if client:
+        print(f"LLM: {client.provider}/{client.model} на {client.base_url}"
+              f"{'' if client.sees_personal_data else ' (вне контура: свободный текст ей не показывается)'}")
+    corpora = build_corpora(_components(a, client))
 
     # снапшот порядка колонок и словарь имён источника - для прохода 2
     snap = profile(a.dsn, a.schema)
@@ -184,16 +194,73 @@ def cmd_run(a) -> int:
     name_dict = _source_name_dict(a.dsn, a.schema)
 
     dump_dir = run_pass1(plan, a.dsn, salt, corpora, work, rl, run_id,
-                         greenmask_bin=a.greenmask, plan_path=Path(a.plan))
+                         greenmask_bin=a.greenmask, plan_path=Path(a.plan),
+                         llm=_direct_llm(client))
     print(f"проход 1 завершён: {dump_dir}")
 
-    ts = TextSanitizer(Mapper(salt, corpora), salt, name_dict)
+    # Третий эшелон NER видит ЖИВОЙ текст, поэтому допускается только модель в
+    # контуре. Кэш вердиктов - версионируемый артефакт (§4.4): повторный прогон
+    # на том же тексте не обращается к модели и даёт тот же результат.
+    ner_cache_path = work / "ner-cache.json"
+    ner_cache = json.loads(ner_cache_path.read_text(encoding="utf-8")) \
+        if ner_cache_path.exists() else {}
+    ts = TextSanitizer(Mapper(salt, corpora), salt, name_dict,
+                       llm=_ner_llm(client), llm_cache=ner_cache)
     summary = process_dump(dump_dir, plan, columns_order, ts, runlog=rl,
                            max_len={c.qualified: c.max_len for c in snap.columns})
+    ner_cache_path.write_text(json.dumps(ts.llm_cache, ensure_ascii=False, indent=1),
+                              encoding="utf-8")
+    if client:
+        print(f"обращений к модели: {len(client.calls)} ({', '.join(sorted(set(client.calls)))})")
     print(f"проход 2 завершён: {json.dumps(summary, ensure_ascii=False)}")
     (work / "run_id").write_text(run_id, encoding="utf-8")
     (work / "dump_path").write_text(str(dump_dir), encoding="utf-8")
     return 0
+
+
+# START_CONTRACT: _components
+#   PURPOSE: Компоненты корпусов: от модели с кэшем на диске либо из поставляемых
+#            словарей. Роль 2 не видит ни одного настоящего значения - модель
+#            порождает материал замен с нуля (§4.4).
+#   INPUTS: { a: аргументы CLI, client: LLMClient|None }
+#   OUTPUTS: { dict ключ корпуса -> список значений }
+#   SIDE_EFFECTS: чтение/запись кэша корпусов, сетевые вызовы при первом прогоне
+# END_CONTRACT: _components
+def _components(a, client) -> dict[str, list[str]]:
+    from sanitizer import llm as llm_mod
+    from sanitizer.corpus import REQUIRED_KEYS, llm_components
+
+    raw = (getattr(a, "corpus_cache", "") or "").strip()
+    if client is None or not raw:      # Path("") == Path(".") - проверять надо строку
+        return load_components(Path(a.components))
+    cache = Path(raw)
+    if not cache.exists():
+        print(f"корпуса: порождаю моделью, кэш {cache}")
+    data = llm_components(cache, generate=lambda kind: llm_mod.corpus_generate(client, kind))
+    missing = [k for k in REQUIRED_KEYS if not data.get(k)]
+    if missing:
+        raise SystemExit(f"КОРПУС ОТ МОДЕЛИ НЕПОЛОН: нет {missing}. "
+                         f"Дальше: удалите {cache} и повторите либо снимите --corpus-cache.")
+    return data
+
+
+def _direct_llm(client):
+    """Роль 3: карта 1:1 для не-ПДн значений. None, если поставщик не настроен."""
+    from sanitizer import llm as llm_mod
+
+    if client is None:
+        return None
+    return lambda qualified, values: llm_mod.direct_map(client, values)
+
+
+def _ner_llm(client):
+    """Роль 4: вердикт по спорному фрагменту. Только модель в контуре - иначе
+    инструмент обезличивания сам отправит персональные данные наружу."""
+    from sanitizer import llm as llm_mod
+
+    if client is None or not client.sees_personal_data:
+        return None
+    return lambda fragment: llm_mod.ner_verdict(client, fragment)
 
 
 def _resolve_dump(path: Path) -> Path:
@@ -352,6 +419,8 @@ def main() -> int:
     p.add_argument("--components", default=DEF_COMPONENTS)
     p.add_argument("--work", default="out")
     p.add_argument("--schema", default="hr")
+    p.add_argument("--corpus-cache", default="",
+                   help="кэш корпусов от модели; пусто - поставляемые словари")
     p.add_argument("--greenmask", default=os.environ.get("GREENMASK_BIN", "greenmask"))
     p.set_defaults(fn=cmd_run)
 

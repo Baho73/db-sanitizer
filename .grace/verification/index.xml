@@ -4,6 +4,7 @@
       <Path>verification/main.xml</Path>
       <Owns>
         <V-M-MAPPER />
+        <V-M-LLM />
         <V-M-CORPUS />
         <V-M-DEMO-DB />
         <V-M-PROFILER />

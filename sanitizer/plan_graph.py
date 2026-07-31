@@ -96,14 +96,32 @@ def _node_profile(state: PlanState) -> dict:
     return {"snapshot_json": snap.to_json()}
 
 
+def _llm_ask(state: PlanState):
+    """Callable для llm_classify либо None. Модель видит ТОЛЬКО метаданные."""
+    from sanitizer import llm as llm_mod
+    from sanitizer.classifier import SemType
+
+    client = llm_mod.from_env()
+    if client is None:
+        return None
+    allowed = [str(t) for t in SemType]
+    return lambda meta: llm_mod.classifier_ask(client, meta, allowed)
+
+
 def _node_classify_and_assign(state: PlanState) -> dict:
     snap = _snapshot(state)
-    votes = llm_classify(snap.columns, Path(state["llm_cache"]))
+    # Голос модели: при настроенном поставщике спрашиваем его и КЛАДЁМ В КЭШ,
+    # при отсутствии - читаем кэш. Без обоих llm_classify честно падает.
+    # Демонстрация обязана идти по кэшу: проверяющий не обязан ставить модель.
+    votes = llm_classify(snap.columns, Path(state["llm_cache"]), ask=_llm_ask(state))
     classified = classify(snap.columns, votes)
     plan = assign(classified, snap,
                   sensitive_categories=set(state.get("sensitive_categories", [])),
                   json_map=state.get("json_map", {}),
-                  llm_available=bool(state.get("llm_available")),
+                  # доступность LLM берётся из ФАКТА настройки поставщика, а не
+                  # из декларации в конфиге: иначе план обещал бы режим direct,
+                  # которого некому исполнить
+                  llm_available=_llm_ask(state) is not None,
                   params=state.get("params"))
     # решения человека применяются ДО диффа и гейта: ревьюер видит итог,
     # а повторный прогон при неизменной схеме даёт пустой дифф

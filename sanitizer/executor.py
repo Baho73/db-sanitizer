@@ -55,25 +55,31 @@ def prepare_artifacts(plan: Plan, dsn: str, salt: Salt, corpora: dict[str, list[
                 cur.execute(sql.SQL("SELECT DISTINCT {c} FROM {t} WHERE {c} IS NOT NULL")
                             .format(c=ident(col), t=ident(table)))
                 values = [r[0] for r in cur.fetchall()]
-                if llm:
-                    mapping = llm(qualified, values)
-                else:  # corpus-fallback; полноценный direct - через LLM на гейте.
+                # Ответ модели проходит фильтр: только известные значения, без
+                # повторов и без совпадений с исходником. Пробелы достраивает
+                # детерминированный генератор - карта 1:1 обязана быть ПОЛНОЙ и
+                # инъективной независимо от того, насколько аккуратна модель.
+                mapping, used = {}, set()
+                for src_value, fake in (llm(qualified, values) if llm else {}).items():
+                    fake = str(fake).strip()
+                    if src_value in values and fake and fake not in used and fake != src_value:
+                        used.add(fake)
+                        mapping[src_value] = fake
+                for v in sorted(v for v in values if v not in mapping):
                     # Замены 1:1 обязаны быть инъективны (энтропия, UNIQUE):
                     # при коллизии базы добавляется детерминированный суффикс.
-                    mapping, used = {}, set()
-                    for v in sorted(values):
-                        base = mapper.pick("org", v.lower(), avoid=v).upper()[:150]
-                        fake = base
-                        for i in range(1, 998):     # суффикс по модулю 997
-                            if fake not in used:
-                                break
-                            fake = f"{base}-{(_h(salt, 'direct', v) + i) % 997}"
-                        if fake in used:            # раньше здесь был вечный цикл
-                            raise ValueError(
-                                f"{qualified}: корпус исчерпан на значении {v!r}. "
-                                f"Дальше: расширьте корпус org либо смените стратегию.")
-                        used.add(fake)
-                        mapping[v] = fake
+                    base = mapper.pick("org", v.lower(), avoid=v).upper()[:150]
+                    fake = base
+                    for i in range(1, 998):     # суффикс по модулю 997
+                        if fake not in used:
+                            break
+                        fake = f"{base}-{(_h(salt, 'direct', v) + i) % 997}"
+                    if fake in used:            # раньше здесь был вечный цикл
+                        raise ValueError(
+                            f"{qualified}: корпус исчерпан. "
+                            f"Дальше: расширьте корпус org либо смените стратегию.")
+                    used.add(fake)
+                    mapping[v] = fake
                 p = out_dir / f"direct.{table}.{col}.json"
                 p.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
                 written.append(p)
@@ -263,7 +269,7 @@ def greenmask_config(plan: Plan, src_dsn: str, dump_dir: Path, plan_path: Path,
 
 def run_pass1(plan: Plan, src_dsn: str, salt: Salt, corpora: dict, work_dir: Path,
               runlog: RunLog, run_id: str, greenmask_bin: str = "greenmask",
-              plan_path: Path | None = None) -> Path:
+              plan_path: Path | None = None, llm=None) -> Path:
     """Артефакты -> конфиг -> greenmask dump. Возвращает каталог дампа.
     Падение = failed в run_log; перезапуск прохода 1 целиком (§5.7)."""
     artifacts = work_dir / "artifacts"
@@ -271,7 +277,7 @@ def run_pass1(plan: Plan, src_dsn: str, salt: Salt, corpora: dict, work_dir: Pat
     dump_dir.mkdir(parents=True, exist_ok=True)
     runlog.mark("pass1", "*", "running")
     try:
-        prepare_artifacts(plan, src_dsn, salt, corpora, artifacts)
+        prepare_artifacts(plan, src_dsn, salt, corpora, artifacts, llm=llm)
         cfg = greenmask_config(plan, src_dsn, dump_dir, plan_path or work_dir / "plan.yaml", artifacts)
         cfg_path = work_dir / "greenmask.yml"
         cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")

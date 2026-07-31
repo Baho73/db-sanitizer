@@ -4,6 +4,7 @@
       <Path>graph/main.xml</Path>
       <Owns>
         <M-MAPPER />
+        <M-LLM />
         <M-CORPUS />
         <M-DEMO-DB />
         <M-PROFILER />
